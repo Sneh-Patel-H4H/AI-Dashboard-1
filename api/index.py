@@ -2,10 +2,11 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
-import anthropic
 import json
 import os
 import re
+import urllib.request
+import urllib.error
 
 app = FastAPI()
 
@@ -16,8 +17,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-_api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-client = anthropic.Anthropic(api_key=_api_key) if _api_key else None
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
 # ── Pydantic Models ──────────────────────────────────────────────────────────
 
@@ -52,7 +54,7 @@ class ChatRequest(BaseModel):
     org_type: str = ""
 
 
-# ── Claude Prompts ───────────────────────────────────────────────────────────
+# ── AI Prompts ───────────────────────────────────────────────────────────────
 
 ANALYZE_SYSTEM_PROMPT = """You are a senior Business Intelligence analyst. You analyze datasets to detect:
 1. Business sector (e.g. Sales/CRM, E-commerce, Marketing, SaaS/Product, Customer Support, Finance, HR, Logistics, Healthcare, Education, or Mixed)
@@ -165,7 +167,6 @@ def _to_number(val) -> float | None:
         return None
     s = str(val).strip()
     cleaned = _CURRENCY_RE.sub("", s)
-    # Handle parenthetical negatives: (1000) -> -1000
     if cleaned.startswith("-") is False and s.startswith("(") and s.endswith(")"):
         cleaned = "-" + cleaned
     try:
@@ -216,7 +217,6 @@ def compute_kpis(rows: list[dict], confirmed_kpis: list[dict], time_column: str 
         if value is None:
             continue
 
-        # Period-over-period change
         change_percent = None
         change_direction = None
         if time_column:
@@ -286,7 +286,6 @@ def build_aggregation_summary(rows: list[dict], column_meta: dict) -> str:
                 lines.append(f"  {gname:<30} {s:>12.1f} {a:>12.1f} {c:>8}")
             parts.append("\n".join(lines))
 
-    # Time series summary
     date_cols = [k for k, v in column_meta.items() if v.get("type") == "date"]
     if date_cols and numeric:
         dc = date_cols[0]
@@ -325,21 +324,61 @@ def build_data_summary(req: AnalyzeRequest) -> str:
     return "\n".join(lines)
 
 
-def call_claude(system_prompt: str, user_message: str) -> dict:
-    """Call Claude and parse JSON response."""
-    if not client:
+# ── Gemini API Call (zero external dependencies) ─────────────────────────────
+
+
+def call_ai(system_prompt: str, user_message: str) -> dict:
+    """Call Google Gemini API and parse JSON response."""
+    if not GEMINI_API_KEY:
         raise HTTPException(
             status_code=500,
-            detail="ANTHROPIC_API_KEY is not configured. Please add it to your Vercel environment variables.",
+            detail="GEMINI_API_KEY is not configured. Please add it to your Vercel environment variables.",
         )
+
+    payload = {
+        "contents": [
+            {"role": "user", "parts": [{"text": user_message}]}
+        ],
+        "systemInstruction": {
+            "parts": [{"text": system_prompt}]
+        },
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "temperature": 0.2,
+        },
+    }
+
+    url = f"{GEMINI_URL}?key={GEMINI_API_KEY}"
+    req_data = json.dumps(payload).encode("utf-8")
+
+    http_req = urllib.request.Request(
+        url,
+        data=req_data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
     try:
-        response = client.messages.create(
-            model="claude-sonnet-4-5-20250514",
-            max_tokens=4096,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_message}],
+        with urllib.request.urlopen(http_req, timeout=55) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        error_body = ""
+        try:
+            error_body = e.read().decode("utf-8")[:300]
+        except Exception:
+            pass
+        raise HTTPException(
+            status_code=500,
+            detail=f"AI service error ({e.code}): {error_body}",
         )
-        text = response.content[0].text
+    except urllib.error.URLError:
+        raise HTTPException(
+            status_code=500,
+            detail="Could not connect to the AI service. Please try again.",
+        )
+
+    try:
+        text = body["candidates"][0]["content"]["parts"][0]["text"]
         # Strip markdown code fences if present
         if text.startswith("```"):
             text = text.split("\n", 1)[1]
@@ -348,20 +387,15 @@ def call_claude(system_prompt: str, user_message: str) -> dict:
             elif "```" in text:
                 text = text[: text.rfind("```")]
         return json.loads(text.strip())
+    except (KeyError, IndexError):
+        raise HTTPException(
+            status_code=500,
+            detail="The AI returned an unexpected response format. Please try again.",
+        )
     except json.JSONDecodeError:
         raise HTTPException(
             status_code=500,
-            detail="The AI returned an unexpected response. Please try again.",
-        )
-    except anthropic.AuthenticationError:
-        raise HTTPException(
-            status_code=500,
-            detail="Invalid API key. Please check your ANTHROPIC_API_KEY in Vercel environment variables.",
-        )
-    except anthropic.APIError as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"AI service error: {str(e)[:200]}",
+            detail="The AI returned invalid data. Please try again.",
         )
 
 
@@ -384,7 +418,7 @@ async def analyze(req: AnalyzeRequest):
 **Sample Data (first 5 rows):**
 {json.dumps(req.sample_rows[:5], indent=2, default=str)}
 """
-        result = call_claude(ANALYZE_SYSTEM_PROMPT, user_message)
+        result = call_ai(ANALYZE_SYSTEM_PROMPT, user_message)
         return result
     except HTTPException:
         raise
@@ -415,7 +449,7 @@ async def dashboard(req: DashboardRequest):
 
 Design 4-6 charts using the actual aggregated values above. Use business-friendly titles and descriptions.
 """
-        result = call_claude(DASHBOARD_SYSTEM_PROMPT, user_message)
+        result = call_ai(DASHBOARD_SYSTEM_PROMPT, user_message)
         result["kpi_cards"] = kpi_cards
         return result
     except HTTPException:
@@ -454,7 +488,7 @@ async def chat(req: ChatRequest):
 
 Provide a helpful answer with text, and include a chart or table if it would help explain the answer.
 """
-        result = call_claude(CHAT_SYSTEM_PROMPT, user_message)
+        result = call_ai(CHAT_SYSTEM_PROMPT, user_message)
         return result
     except HTTPException:
         raise
@@ -469,6 +503,7 @@ Provide a helpful answer with text, and include a chart or table if it would hel
 async def health():
     return {
         "status": "ok",
-        "api_key_set": bool(_api_key),
-        "api_key_prefix": _api_key[:12] + "..." if _api_key else "NOT SET",
+        "ai_provider": "gemini",
+        "api_key_set": bool(GEMINI_API_KEY),
+        "api_key_prefix": GEMINI_API_KEY[:8] + "..." if GEMINI_API_KEY else "NOT SET",
     }
