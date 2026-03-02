@@ -18,9 +18,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ── AI Provider Config (auto-detect from env vars) ──────────────────────────
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+
 GEMINI_MODELS = ["gemini-2.0-flash", "gemini-1.5-flash"]
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+GROQ_MODEL = "llama-3.3-70b-versatile"
 
 # ── Pydantic Models ──────────────────────────────────────────────────────────
 
@@ -328,105 +333,120 @@ def build_data_summary(req: AnalyzeRequest) -> str:
 # ── Gemini API Call (zero external dependencies) ─────────────────────────────
 
 
-def _gemini_request(model: str, payload: dict) -> dict:
-    """Make a single request to Gemini API. Returns parsed JSON body or raises."""
-    url = f"{GEMINI_BASE}/{model}:generateContent?key={GEMINI_API_KEY}"
+def _http_post(url: str, payload: dict, headers: dict) -> dict:
+    """Make an HTTP POST request and return parsed JSON."""
     req_data = json.dumps(payload).encode("utf-8")
-
-    http_req = urllib.request.Request(
-        url,
-        data=req_data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-
+    http_req = urllib.request.Request(url, data=req_data, headers=headers, method="POST")
     with urllib.request.urlopen(http_req, timeout=55) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
+def _call_groq(system_prompt: str, user_message: str) -> str:
+    """Call Groq API, return raw text response."""
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ],
+        "response_format": {"type": "json_object"},
+        "temperature": 0.2,
+        "max_tokens": 4096,
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+    }
+    body = _http_post(GROQ_URL, payload, headers)
+    return body["choices"][0]["message"]["content"]
+
+
+def _call_gemini(system_prompt: str, user_message: str) -> str:
+    """Call Gemini API with model fallback, return raw text response."""
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": user_message}]}],
+        "systemInstruction": {"parts": [{"text": system_prompt}]},
+        "generationConfig": {"responseMimeType": "application/json", "temperature": 0.2},
+    }
+    headers = {"Content-Type": "application/json"}
+
+    for model in GEMINI_MODELS:
+        try:
+            url = f"{GEMINI_BASE}/{model}:generateContent?key={GEMINI_API_KEY}"
+            body = _http_post(url, payload, headers)
+            return body["candidates"][0]["content"]["parts"][0]["text"]
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                continue  # Try next model
+            raise
+    raise Exception("All Gemini models failed")
+
+
+def _parse_ai_text(text: str) -> dict:
+    """Parse AI response text into JSON dict."""
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1]
+        if text.endswith("```"):
+            text = text[:-3]
+        elif "```" in text:
+            text = text[: text.rfind("```")]
+    return json.loads(text.strip())
+
+
 def call_ai(system_prompt: str, user_message: str) -> dict:
-    """Call Google Gemini API with retry and model fallback."""
-    if not GEMINI_API_KEY:
+    """Call AI with auto-provider detection, retry, and fallback."""
+    providers = []
+    if GROQ_API_KEY:
+        providers.append(("Groq", _call_groq))
+    if GEMINI_API_KEY:
+        providers.append(("Gemini", _call_gemini))
+
+    if not providers:
         raise HTTPException(
             status_code=500,
-            detail="GEMINI_API_KEY is not configured. Please add it to your Vercel environment variables.",
+            detail="No AI API key configured. Add GROQ_API_KEY or GEMINI_API_KEY to your Vercel environment variables. Get a free Groq key at https://console.groq.com",
         )
 
-    payload = {
-        "contents": [
-            {"role": "user", "parts": [{"text": user_message}]}
-        ],
-        "systemInstruction": {
-            "parts": [{"text": system_prompt}]
-        },
-        "generationConfig": {
-            "responseMimeType": "application/json",
-            "temperature": 0.2,
-        },
-    }
+    last_error_msg = ""
 
-    last_error = None
-
-    # Try each model with retries
-    for model in GEMINI_MODELS:
+    for provider_name, provider_fn in providers:
         for attempt in range(3):
             try:
-                body = _gemini_request(model, payload)
-
-                text = body["candidates"][0]["content"]["parts"][0]["text"]
-                # Strip markdown code fences if present
-                if text.startswith("```"):
-                    text = text.split("\n", 1)[1]
-                    if text.endswith("```"):
-                        text = text[:-3]
-                    elif "```" in text:
-                        text = text[: text.rfind("```")]
-                return json.loads(text.strip())
-
+                raw_text = provider_fn(system_prompt, user_message)
+                return _parse_ai_text(raw_text)
             except urllib.error.HTTPError as e:
-                last_error = e
-                error_code = e.code
-                if error_code == 429:
-                    # Rate limited — wait and retry
+                error_body = ""
+                try:
+                    error_body = e.read().decode("utf-8")[:300]
+                except Exception:
+                    pass
+                if e.code == 429:
+                    last_error_msg = f"{provider_name} rate limited"
                     time.sleep(2 * (attempt + 1))
                     continue
-                elif error_code == 404:
-                    # Model not found — try next model
-                    break
                 else:
-                    error_body = ""
-                    try:
-                        error_body = e.read().decode("utf-8")[:300]
-                    except Exception:
-                        pass
-                    raise HTTPException(
-                        status_code=500,
-                        detail=f"AI service error ({error_code}): {error_body}",
-                    )
+                    last_error_msg = f"{provider_name} error ({e.code}): {error_body}"
+                    break  # Try next provider
             except urllib.error.URLError:
-                raise HTTPException(
-                    status_code=500,
-                    detail="Could not connect to the AI service. Please try again.",
-                )
-            except (KeyError, IndexError):
-                raise HTTPException(
-                    status_code=500,
-                    detail="The AI returned an unexpected response format. Please try again.",
-                )
+                last_error_msg = f"Could not connect to {provider_name}"
+                break
             except json.JSONDecodeError:
-                # Retry on bad JSON
                 if attempt < 2:
                     time.sleep(1)
                     continue
-                raise HTTPException(
-                    status_code=500,
-                    detail="The AI returned invalid data. Please try again.",
-                )
+                last_error_msg = f"{provider_name} returned invalid JSON"
+                break
+            except (KeyError, IndexError):
+                last_error_msg = f"{provider_name} returned unexpected format"
+                break
+            except Exception as exc:
+                last_error_msg = f"{provider_name}: {str(exc)[:200]}"
+                break
 
-    # All retries exhausted
     raise HTTPException(
         status_code=500,
-        detail="The AI service is temporarily busy. Please wait a moment and try again.",
+        detail=f"AI service unavailable. {last_error_msg}. Please try again in a moment.",
     )
 
 
@@ -532,9 +552,12 @@ Provide a helpful answer with text, and include a chart or table if it would hel
 
 @app.get("/api/health")
 async def health():
+    providers = []
+    if GROQ_API_KEY:
+        providers.append("groq")
+    if GEMINI_API_KEY:
+        providers.append("gemini")
     return {
         "status": "ok",
-        "ai_provider": "gemini",
-        "api_key_set": bool(GEMINI_API_KEY),
-        "api_key_prefix": GEMINI_API_KEY[:8] + "..." if GEMINI_API_KEY else "NOT SET",
+        "providers": providers or ["NONE - add GROQ_API_KEY or GEMINI_API_KEY"],
     }
