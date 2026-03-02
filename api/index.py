@@ -7,6 +7,7 @@ import os
 import re
 import urllib.request
 import urllib.error
+import time
 
 app = FastAPI()
 
@@ -18,8 +19,8 @@ app.add_middleware(
 )
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = "gemini-2.0-flash"
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+GEMINI_MODELS = ["gemini-2.0-flash", "gemini-1.5-flash"]
+GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 
 # ── Pydantic Models ──────────────────────────────────────────────────────────
 
@@ -327,8 +328,24 @@ def build_data_summary(req: AnalyzeRequest) -> str:
 # ── Gemini API Call (zero external dependencies) ─────────────────────────────
 
 
+def _gemini_request(model: str, payload: dict) -> dict:
+    """Make a single request to Gemini API. Returns parsed JSON body or raises."""
+    url = f"{GEMINI_BASE}/{model}:generateContent?key={GEMINI_API_KEY}"
+    req_data = json.dumps(payload).encode("utf-8")
+
+    http_req = urllib.request.Request(
+        url,
+        data=req_data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    with urllib.request.urlopen(http_req, timeout=55) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
 def call_ai(system_prompt: str, user_message: str) -> dict:
-    """Call Google Gemini API and parse JSON response."""
+    """Call Google Gemini API with retry and model fallback."""
     if not GEMINI_API_KEY:
         raise HTTPException(
             status_code=500,
@@ -348,55 +365,69 @@ def call_ai(system_prompt: str, user_message: str) -> dict:
         },
     }
 
-    url = f"{GEMINI_URL}?key={GEMINI_API_KEY}"
-    req_data = json.dumps(payload).encode("utf-8")
+    last_error = None
 
-    http_req = urllib.request.Request(
-        url,
-        data=req_data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
+    # Try each model with retries
+    for model in GEMINI_MODELS:
+        for attempt in range(3):
+            try:
+                body = _gemini_request(model, payload)
+
+                text = body["candidates"][0]["content"]["parts"][0]["text"]
+                # Strip markdown code fences if present
+                if text.startswith("```"):
+                    text = text.split("\n", 1)[1]
+                    if text.endswith("```"):
+                        text = text[:-3]
+                    elif "```" in text:
+                        text = text[: text.rfind("```")]
+                return json.loads(text.strip())
+
+            except urllib.error.HTTPError as e:
+                last_error = e
+                error_code = e.code
+                if error_code == 429:
+                    # Rate limited — wait and retry
+                    time.sleep(2 * (attempt + 1))
+                    continue
+                elif error_code == 404:
+                    # Model not found — try next model
+                    break
+                else:
+                    error_body = ""
+                    try:
+                        error_body = e.read().decode("utf-8")[:300]
+                    except Exception:
+                        pass
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"AI service error ({error_code}): {error_body}",
+                    )
+            except urllib.error.URLError:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Could not connect to the AI service. Please try again.",
+                )
+            except (KeyError, IndexError):
+                raise HTTPException(
+                    status_code=500,
+                    detail="The AI returned an unexpected response format. Please try again.",
+                )
+            except json.JSONDecodeError:
+                # Retry on bad JSON
+                if attempt < 2:
+                    time.sleep(1)
+                    continue
+                raise HTTPException(
+                    status_code=500,
+                    detail="The AI returned invalid data. Please try again.",
+                )
+
+    # All retries exhausted
+    raise HTTPException(
+        status_code=500,
+        detail="The AI service is temporarily busy. Please wait a moment and try again.",
     )
-
-    try:
-        with urllib.request.urlopen(http_req, timeout=55) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        error_body = ""
-        try:
-            error_body = e.read().decode("utf-8")[:300]
-        except Exception:
-            pass
-        raise HTTPException(
-            status_code=500,
-            detail=f"AI service error ({e.code}): {error_body}",
-        )
-    except urllib.error.URLError:
-        raise HTTPException(
-            status_code=500,
-            detail="Could not connect to the AI service. Please try again.",
-        )
-
-    try:
-        text = body["candidates"][0]["content"]["parts"][0]["text"]
-        # Strip markdown code fences if present
-        if text.startswith("```"):
-            text = text.split("\n", 1)[1]
-            if text.endswith("```"):
-                text = text[:-3]
-            elif "```" in text:
-                text = text[: text.rfind("```")]
-        return json.loads(text.strip())
-    except (KeyError, IndexError):
-        raise HTTPException(
-            status_code=500,
-            detail="The AI returned an unexpected response format. Please try again.",
-        )
-    except json.JSONDecodeError:
-        raise HTTPException(
-            status_code=500,
-            detail="The AI returned invalid data. Please try again.",
-        )
 
 
 # ── API Endpoints ────────────────────────────────────────────────────────────
