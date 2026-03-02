@@ -16,7 +16,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+_api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+client = anthropic.Anthropic(api_key=_api_key) if _api_key else None
 
 # ── Pydantic Models ──────────────────────────────────────────────────────────
 
@@ -326,6 +327,11 @@ def build_data_summary(req: AnalyzeRequest) -> str:
 
 def call_claude(system_prompt: str, user_message: str) -> dict:
     """Call Claude and parse JSON response."""
+    if not client:
+        raise HTTPException(
+            status_code=500,
+            detail="ANTHROPIC_API_KEY is not configured. Please add it to your Vercel environment variables.",
+        )
     try:
         response = client.messages.create(
             model="claude-sonnet-4-5-20250514",
@@ -347,10 +353,15 @@ def call_claude(system_prompt: str, user_message: str) -> dict:
             status_code=500,
             detail="The AI returned an unexpected response. Please try again.",
         )
-    except anthropic.APIError:
+    except anthropic.AuthenticationError:
         raise HTTPException(
             status_code=500,
-            detail="Could not connect to the AI service. Please check your API key and try again.",
+            detail="Invalid API key. Please check your ANTHROPIC_API_KEY in Vercel environment variables.",
+        )
+    except anthropic.APIError as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"AI service error: {str(e)[:200]}",
         )
 
 
@@ -456,4 +467,8 @@ Provide a helpful answer with text, and include a chart or table if it would hel
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "api_key_set": bool(_api_key),
+        "api_key_prefix": _api_key[:12] + "..." if _api_key else "NOT SET",
+    }
