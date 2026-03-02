@@ -1,0 +1,82 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    @apply border-slate-200 dark:border-slate-700;
+  }
+
+  body {
+    @apply antialiased;
+  }
+
+  ::-webkit-scrollbar {
+    @apply w-2;
+  }
+
+  ::-webkit-scrollbar-track {
+    @apply bg-transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    @apply bg-slate-300 dark:bg-slate-600 rounded-full;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-slate-400 dark:bg-slate-500;
+  }
+}
+
+@layer components {
+  .card {
+    @apply bg-white dark:bg-slate-800 rounded-xl border shadow-sm;
+  }
+
+  .btn-primary {
+    @apply bg-primary-600 hover:bg-primary-700 text-white font-medium px-6 py-2.5 rounded-lg
+           transition-colors duration-200 disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+
+  .btn-secondary {
+    @apply bg-white dark:bg-slate-800 hover:bg-slate-50 dark:hover:bg-slate-700
+           text-slate-700 dark:text-slate-200 font-medium px-6 py-2.5 rounded-lg
+           border transition-colors duration-200;
+  }
+
+  .badge {
+    @apply inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium;
+  }
+
+  .badge-high {
+    @apply badge bg-emerald-100 text-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-400;
+  }
+
+  .badge-medium {
+    @apply badge bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-400;
+  }
+
+  .badge-low {
+    @apply badge bg-rose-100 text-rose-800 dark:bg-rose-900/30 dark:text-rose-400;
+  }
+
+  .input {
+    @apply w-full px-4 py-2.5 rounded-lg border bg-white dark:bg-slate-800
+           text-slate-900 dark:text-slate-100 placeholder-slate-400
+           focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent
+           transition-shadow duration-200;
+  }
+
+  .skeleton {
+    @apply animate-pulse bg-slate-200 dark:bg-slate-700 rounded;
+  }
+}
+
+/* Plotly overrides for dark mode */
+.dark .js-plotly-plot .plotly .modebar-btn path {
+  fill: #94a3b8;
+}
+
+.dark .js-plotly-plot .plotly .modebar-btn:hover path {
+  fill: #e2e8f0;
+}

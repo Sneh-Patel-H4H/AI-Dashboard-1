@@ -1,0 +1,14 @@
+{
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist",
+  "framework": null,
+  "rewrites": [
+    { "source": "/api/(.*)", "destination": "/api/index.py" }
+  ],
+  "functions": {
+    "api/index.py": {
+      "runtime": "@vercel/python@4.4.0",
+      "maxDuration": 60
+    }
+  }
+}
