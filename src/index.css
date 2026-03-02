@@ -72,6 +72,18 @@
   }
 }
 
+/* Chart container — fill parent height */
+.card > div:last-child .js-plotly-plot {
+  height: 100% !important;
+}
+
+/* KPI grid responsive override */
+@media (max-width: 640px) {
+  .kpi-grid {
+    grid-template-columns: repeat(2, 1fr) !important;
+  }
+}
+
 /* Plotly overrides for dark mode */
 .dark .js-plotly-plot .plotly .modebar-btn path {
   fill: #94a3b8;
@@ -79,4 +91,21 @@
 
 .dark .js-plotly-plot .plotly .modebar-btn:hover path {
   fill: #e2e8f0;
+}
+
+/* Plotly modebar position fix */
+.js-plotly-plot .plotly .modebar {
+  top: 0 !important;
+  right: 4px !important;
+}
+
+/* Range slider styling */
+input[type='range']::-webkit-slider-runnable-track {
+  height: 4px;
+  background: transparent;
+}
+
+input[type='range']::-moz-range-track {
+  height: 4px;
+  background: transparent;
 }
