@@ -99,13 +99,30 @@
   right: 4px !important;
 }
 
-/* Range slider styling */
-input[type='range']::-webkit-slider-runnable-track {
-  height: 4px;
+/* Range slider — hide native track, show only thumbs */
+input[type='range'] {
+  -webkit-appearance: none;
+  appearance: none;
   background: transparent;
 }
 
-input[type='range']::-moz-range-track {
-  height: 4px;
+input[type='range']::-webkit-slider-runnable-track {
+  height: 6px;
   background: transparent;
+  border: none;
+}
+
+input[type='range']::-moz-range-track {
+  height: 6px;
+  background: transparent;
+  border: none;
+}
+
+input[type='range']:focus {
+  outline: none;
+}
+
+/* Date input dark mode */
+.dark input[type='date']::-webkit-calendar-picker-indicator {
+  filter: invert(0.7);
 }
