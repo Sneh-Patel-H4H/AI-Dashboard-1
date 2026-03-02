@@ -99,30 +99,17 @@
   right: 4px !important;
 }
 
-/* Range slider — hide native track, show only thumbs */
-input[type='range'] {
-  -webkit-appearance: none;
-  appearance: none;
-  background: transparent;
-}
-
-input[type='range']::-webkit-slider-runnable-track {
-  height: 6px;
-  background: transparent;
-  border: none;
-}
-
-input[type='range']::-moz-range-track {
-  height: 6px;
-  background: transparent;
-  border: none;
-}
-
-input[type='range']:focus {
-  outline: none;
-}
-
 /* Date input dark mode */
 .dark input[type='date']::-webkit-calendar-picker-indicator {
   filter: invert(0.7);
+}
+
+/* Hide number input spinners (used in filter range inputs) */
+input[type='number'].no-spin::-webkit-outer-spin-button,
+input[type='number'].no-spin::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+input[type='number'].no-spin {
+  -moz-appearance: textfield;
 }

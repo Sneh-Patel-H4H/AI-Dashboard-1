@@ -29,9 +29,7 @@ function Dropdown({ label, options, value, onChange }) {
       >
         <span className="truncate flex-1 text-left">{displayLabel}</span>
         <ChevronDown
-          className={`w-3.5 h-3.5 shrink-0 text-slate-400 transition-transform ${
-            open ? 'rotate-180' : ''
-          }`}
+          className={`w-3.5 h-3.5 shrink-0 text-slate-400 transition-transform ${open ? 'rotate-180' : ''}`}
         />
       </button>
       <AnimatePresence>
@@ -46,32 +44,18 @@ function Dropdown({ label, options, value, onChange }) {
             style={{ zIndex: 9999 }}
           >
             <button
-              onClick={() => {
-                onChange(null);
-                setOpen(false);
-              }}
+              onClick={() => { onChange(null); setOpen(false); }}
               className={`w-full text-left text-xs px-3 py-2.5 hover:bg-slate-100 dark:hover:bg-slate-700
-                         ${
-                           !value
-                             ? 'text-primary-600 font-semibold bg-primary-50 dark:bg-primary-950/20'
-                             : 'text-slate-600 dark:text-slate-300'
-                         }`}
+                         ${!value ? 'text-primary-600 font-semibold bg-primary-50 dark:bg-primary-950/20' : 'text-slate-600 dark:text-slate-300'}`}
             >
               All {label}
             </button>
             {options.map((opt) => (
               <button
                 key={opt}
-                onClick={() => {
-                  onChange(opt);
-                  setOpen(false);
-                }}
+                onClick={() => { onChange(opt); setOpen(false); }}
                 className={`w-full text-left text-xs px-3 py-2.5 hover:bg-slate-100 dark:hover:bg-slate-700 truncate
-                           ${
-                             value === opt
-                               ? 'text-primary-600 font-semibold bg-primary-50 dark:bg-primary-950/20'
-                               : 'text-slate-600 dark:text-slate-300'
-                           }`}
+                           ${value === opt ? 'text-primary-600 font-semibold bg-primary-50 dark:bg-primary-950/20' : 'text-slate-600 dark:text-slate-300'}`}
               >
                 {opt}
               </button>
@@ -83,108 +67,68 @@ function Dropdown({ label, options, value, onChange }) {
   );
 }
 
-/* ── Range Slider (clean single-thumb design) ────────────── */
-function RangeSlider({ label, min, max, value, onChange }) {
-  const [localMin, setLocalMin] = useState(value[0]);
-  const [localMax, setLocalMax] = useState(value[1]);
-  const rangeWidth = max - min;
-
-  useEffect(() => {
-    setLocalMin(value[0]);
-    setLocalMax(value[1]);
-  }, [value]);
-
-  if (rangeWidth <= 0 || !isFinite(min) || !isFinite(max)) return null;
-
-  const commitChange = (newMin, newMax) => {
-    onChange([newMin, newMax]);
-  };
-
-  const formatVal = (v) => {
+/* ── Number Range Input (clean design, no native range slider) ── */
+function NumberRange({ label, min, max, value, onChange }) {
+  const formatDisplay = (v) => {
     if (Math.abs(v) >= 1e6) return `${(v / 1e6).toFixed(1)}M`;
     if (Math.abs(v) >= 1e3) return `${(v / 1e3).toFixed(1)}K`;
     return v % 1 === 0 ? String(v) : v.toFixed(1);
   };
 
-  const leftPct = ((localMin - min) / rangeWidth) * 100;
-  const rightPct = ((localMax - min) / rangeWidth) * 100;
-  const isFiltered = localMin > min || localMax < max;
+  if (!isFinite(min) || !isFinite(max) || min === max) return null;
+
+  const isFiltered = value[0] > min || value[1] < max;
+  const pctLeft = ((value[0] - min) / (max - min)) * 100;
+  const pctRight = ((value[1] - min) / (max - min)) * 100;
 
   return (
     <div
-      className={`flex items-center gap-2 px-3 py-2 rounded-lg border bg-white dark:bg-slate-800
-                  min-w-[220px] max-w-[280px]
-                  ${isFiltered ? 'border-primary-400 dark:border-primary-500 ring-1 ring-primary-200 dark:ring-primary-800' : ''}`}
+      className={`flex items-center gap-3 px-3 py-2 rounded-lg border bg-white dark:bg-slate-800
+                  ${isFiltered ? 'border-primary-400 dark:border-primary-500' : ''}`}
     >
       <span className="text-[10px] font-semibold text-slate-400 dark:text-slate-500 uppercase tracking-wide whitespace-nowrap">
         {label}
       </span>
-      <div className="flex items-center gap-2 flex-1 min-w-0">
-        <span className="text-[11px] font-medium text-slate-600 dark:text-slate-300 tabular-nums whitespace-nowrap">
-          {formatVal(localMin)}
-        </span>
-        <div className="relative flex-1 h-6 flex items-center">
-          {/* Track background */}
-          <div className="absolute h-1.5 w-full bg-slate-200 dark:bg-slate-600 rounded-full" />
-          {/* Active track */}
-          <div
-            className="absolute h-1.5 bg-primary-500 rounded-full"
-            style={{ left: `${leftPct}%`, width: `${rightPct - leftPct}%` }}
-          />
-          {/* Min thumb */}
-          <input
-            type="range"
-            min={min}
-            max={max}
-            step={rangeWidth / 200}
-            value={localMin}
-            onChange={(e) => {
-              const v = Math.min(Number(e.target.value), localMax);
-              setLocalMin(v);
-            }}
-            onMouseUp={() => commitChange(localMin, localMax)}
-            onTouchEnd={() => commitChange(localMin, localMax)}
-            className="absolute w-full h-6 appearance-none bg-transparent cursor-pointer
-                       [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:h-4
-                       [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-primary-600
-                       [&::-webkit-slider-thumb]:border-2 [&::-webkit-slider-thumb]:border-white
-                       [&::-webkit-slider-thumb]:shadow-md [&::-webkit-slider-thumb]:cursor-grab
-                       [&::-webkit-slider-thumb]:relative [&::-webkit-slider-thumb]:z-20
-                       [&::-moz-range-thumb]:w-4 [&::-moz-range-thumb]:h-4
-                       [&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:bg-primary-600
-                       [&::-moz-range-thumb]:border-2 [&::-moz-range-thumb]:border-white
-                       [&::-moz-range-thumb]:shadow-md [&::-moz-range-thumb]:cursor-grab"
-            style={{ zIndex: 3 }}
-          />
-          {/* Max thumb */}
-          <input
-            type="range"
-            min={min}
-            max={max}
-            step={rangeWidth / 200}
-            value={localMax}
-            onChange={(e) => {
-              const v = Math.max(Number(e.target.value), localMin);
-              setLocalMax(v);
-            }}
-            onMouseUp={() => commitChange(localMin, localMax)}
-            onTouchEnd={() => commitChange(localMin, localMax)}
-            className="absolute w-full h-6 appearance-none bg-transparent cursor-pointer
-                       [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:h-4
-                       [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-primary-600
-                       [&::-webkit-slider-thumb]:border-2 [&::-webkit-slider-thumb]:border-white
-                       [&::-webkit-slider-thumb]:shadow-md [&::-webkit-slider-thumb]:cursor-grab
-                       [&::-moz-range-thumb]:w-4 [&::-moz-range-thumb]:h-4
-                       [&::-moz-range-thumb]:rounded-full [&::-moz-range-thumb]:bg-primary-600
-                       [&::-moz-range-thumb]:border-2 [&::-moz-range-thumb]:border-white
-                       [&::-moz-range-thumb]:shadow-md [&::-moz-range-thumb]:cursor-grab"
-            style={{ zIndex: 4 }}
-          />
-        </div>
-        <span className="text-[11px] font-medium text-slate-600 dark:text-slate-300 tabular-nums whitespace-nowrap">
-          {formatVal(localMax)}
-        </span>
+
+      {/* Min input */}
+      <input
+        type="number"
+        value={Math.round(value[0])}
+        min={min}
+        max={value[1]}
+        onChange={(e) => {
+          const v = Number(e.target.value);
+          if (!isNaN(v) && v <= value[1]) onChange([v, value[1]]);
+        }}
+        className="w-[70px] text-[11px] font-medium text-center rounded border
+                   bg-slate-50 dark:bg-slate-700 text-slate-700 dark:text-slate-200
+                   px-1.5 py-1 focus:outline-none focus:ring-1 focus:ring-primary-500
+                   [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
+      />
+
+      {/* Visual bar */}
+      <div className="flex-1 min-w-[60px] h-2 bg-slate-200 dark:bg-slate-600 rounded-full relative">
+        <div
+          className="absolute h-full bg-primary-500 rounded-full"
+          style={{ left: `${pctLeft}%`, right: `${100 - pctRight}%` }}
+        />
       </div>
+
+      {/* Max input */}
+      <input
+        type="number"
+        value={Math.round(value[1])}
+        min={value[0]}
+        max={max}
+        onChange={(e) => {
+          const v = Number(e.target.value);
+          if (!isNaN(v) && v >= value[0]) onChange([value[0], v]);
+        }}
+        className="w-[70px] text-[11px] font-medium text-center rounded border
+                   bg-slate-50 dark:bg-slate-700 text-slate-700 dark:text-slate-200
+                   px-1.5 py-1 focus:outline-none focus:ring-1 focus:ring-primary-500
+                   [appearance:textfield] [&::-webkit-outer-spin-button]:appearance-none [&::-webkit-inner-spin-button]:appearance-none"
+      />
     </div>
   );
 }
@@ -204,8 +148,7 @@ function DateFilter({ label, minDate, maxDate, value, onChange }) {
         max={value[1] || maxDate}
         onChange={(e) => onChange([e.target.value, value[1] || maxDate])}
         className="text-[11px] bg-transparent text-slate-700 dark:text-slate-200 border-0 p-0
-                   focus:outline-none focus:ring-0 w-[105px]
-                   [color-scheme:dark]:dark"
+                   focus:outline-none focus:ring-0 w-[105px]"
       />
       <span className="text-[10px] text-slate-400">to</span>
       <input
@@ -215,24 +158,17 @@ function DateFilter({ label, minDate, maxDate, value, onChange }) {
         max={maxDate}
         onChange={(e) => onChange([value[0] || minDate, e.target.value])}
         className="text-[11px] bg-transparent text-slate-700 dark:text-slate-200 border-0 p-0
-                   focus:outline-none focus:ring-0 w-[105px]
-                   [color-scheme:dark]:dark"
+                   focus:outline-none focus:ring-0 w-[105px]"
       />
     </div>
   );
 }
 
 /* ── FilterBar ──────────────────────────────────────────── */
-export default function FilterBar({
-  parsedData,
-  columnMeta,
-  filters,
-  onFilterChange,
-}) {
+export default function FilterBar({ parsedData, columnMeta, filters, onFilterChange }) {
   const [searchTerm, setSearchTerm] = useState('');
   const [expanded, setExpanded] = useState(true);
 
-  // Build filter options from data
   const { categoricalFilters, numericFilters, dateFilters } = useMemo(() => {
     if (!parsedData || !columnMeta)
       return { categoricalFilters: [], numericFilters: [], dateFilters: [] };
@@ -242,21 +178,11 @@ export default function FilterBar({
     const dates = [];
 
     for (const [col, meta] of Object.entries(columnMeta)) {
-      if (
-        meta.type === 'string' &&
-        meta.uniqueCount > 1 &&
-        meta.uniqueCount <= 30
-      ) {
+      if (meta.type === 'string' && meta.uniqueCount > 1 && meta.uniqueCount <= 30) {
         const uniqueVals = new Set();
         for (const row of parsedData.rows) {
           const v = row[col];
-          if (
-            v != null &&
-            String(v).trim() &&
-            !['none', 'null', 'nan', ''].includes(
-              String(v).toLowerCase().trim()
-            )
-          ) {
+          if (v != null && String(v).trim() && !['none', 'null', 'nan', ''].includes(String(v).toLowerCase().trim())) {
             uniqueVals.add(String(v).trim());
           }
           if (uniqueVals.size >= 30) break;
@@ -264,23 +190,15 @@ export default function FilterBar({
         if (uniqueVals.size > 1) {
           categorical.push({ column: col, options: [...uniqueVals].sort() });
         }
-      } else if (
-        meta.type === 'numeric' &&
-        meta.min != null &&
-        meta.max != null &&
-        meta.min !== meta.max
-      ) {
+      } else if (meta.type === 'numeric' && meta.min != null && meta.max != null && meta.min !== meta.max) {
         numeric.push({ column: col, min: meta.min, max: meta.max });
       } else if (meta.type === 'date') {
-        // Find min/max date strings
         let minD = null;
         let maxD = null;
         for (const row of parsedData.rows) {
           const v = row[col];
           if (!v) continue;
-          const s = String(v).trim();
-          // Try to parse as date and get YYYY-MM-DD
-          const d = new Date(s);
+          const d = new Date(String(v).trim());
           if (isNaN(d.getTime())) continue;
           const iso = d.toISOString().slice(0, 10);
           if (!minD || iso < minD) minD = iso;
@@ -311,18 +229,15 @@ export default function FilterBar({
   };
 
   const handleCategoricalChange = (col, val) => {
-    const newCat = { ...(filters.categorical || {}), [col]: val };
-    onFilterChange({ ...filters, categorical: newCat });
+    onFilterChange({ ...filters, categorical: { ...(filters.categorical || {}), [col]: val } });
   };
 
   const handleNumericChange = (col, range) => {
-    const newNum = { ...(filters.numeric || {}), [col]: range };
-    onFilterChange({ ...filters, numeric: newNum });
+    onFilterChange({ ...filters, numeric: { ...(filters.numeric || {}), [col]: range } });
   };
 
   const handleDateChange = (col, range) => {
-    const newDate = { ...(filters.date || {}), [col]: range };
-    onFilterChange({ ...filters, date: newDate });
+    onFilterChange({ ...filters, date: { ...(filters.date || {}), [col]: range } });
   };
 
   const handleSearch = (val) => {
@@ -330,11 +245,7 @@ export default function FilterBar({
     onFilterChange({ ...filters, search: val });
   };
 
-  if (
-    categoricalFilters.length === 0 &&
-    numericFilters.length === 0 &&
-    dateFilters.length === 0
-  )
+  if (categoricalFilters.length === 0 && numericFilters.length === 0 && dateFilters.length === 0)
     return null;
 
   return (
@@ -352,19 +263,11 @@ export default function FilterBar({
         >
           <SlidersHorizontal className="w-3.5 h-3.5" />
           Filters
-          <ChevronDown
-            className={`w-3.5 h-3.5 transition-transform ${expanded ? 'rotate-180' : ''}`}
-          />
+          <ChevronDown className={`w-3.5 h-3.5 transition-transform ${expanded ? 'rotate-180' : ''}`} />
         </button>
-
         {hasAnyFilter && (
-          <button
-            onClick={clearAll}
-            className="flex items-center gap-1 text-xs font-medium text-primary-600 dark:text-primary-400
-                       hover:text-primary-700 dark:hover:text-primary-300 transition-colors"
-          >
-            <X className="w-3 h-3" />
-            Clear all
+          <button onClick={clearAll} className="flex items-center gap-1 text-xs font-medium text-primary-600 dark:text-primary-400 hover:text-primary-700 dark:hover:text-primary-300 transition-colors">
+            <X className="w-3 h-3" /> Clear all
           </button>
         )}
       </div>
@@ -381,7 +284,6 @@ export default function FilterBar({
             <div className="px-4 pb-3">
               {/* Row 1: Search + Category dropdowns */}
               <div className="flex flex-wrap items-center gap-2.5 mb-2.5">
-                {/* Search */}
                 <div className="relative min-w-[180px] max-w-[220px]">
                   <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-slate-400" />
                   <input
@@ -394,52 +296,24 @@ export default function FilterBar({
                                focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent"
                   />
                   {searchTerm && (
-                    <button
-                      onClick={() => handleSearch('')}
-                      className="absolute right-2.5 top-1/2 -translate-y-1/2"
-                    >
+                    <button onClick={() => handleSearch('')} className="absolute right-2.5 top-1/2 -translate-y-1/2">
                       <X className="w-3.5 h-3.5 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200" />
                     </button>
                   )}
                 </div>
-
-                {/* Categorical Dropdowns */}
                 {categoricalFilters.map((f) => (
-                  <Dropdown
-                    key={f.column}
-                    label={f.column.replace(/_/g, ' ')}
-                    options={f.options}
-                    value={filters.categorical?.[f.column] || null}
-                    onChange={(val) => handleCategoricalChange(f.column, val)}
-                  />
+                  <Dropdown key={f.column} label={f.column.replace(/_/g, ' ')} options={f.options} value={filters.categorical?.[f.column] || null} onChange={(val) => handleCategoricalChange(f.column, val)} />
                 ))}
               </div>
 
-              {/* Row 2: Date filters + Range sliders */}
+              {/* Row 2: Date filters + Number ranges */}
               {(dateFilters.length > 0 || numericFilters.length > 0) && (
                 <div className="flex flex-wrap items-center gap-2.5">
-                  {/* Date Filters */}
                   {dateFilters.map((f) => (
-                    <DateFilter
-                      key={f.column}
-                      label={f.column.replace(/_/g, ' ')}
-                      minDate={f.minDate}
-                      maxDate={f.maxDate}
-                      value={filters.date?.[f.column] || [f.minDate, f.maxDate]}
-                      onChange={(range) => handleDateChange(f.column, range)}
-                    />
+                    <DateFilter key={f.column} label={f.column.replace(/_/g, ' ')} minDate={f.minDate} maxDate={f.maxDate} value={filters.date?.[f.column] || [f.minDate, f.maxDate]} onChange={(range) => handleDateChange(f.column, range)} />
                   ))}
-
-                  {/* Range Sliders */}
                   {numericFilters.map((f) => (
-                    <RangeSlider
-                      key={f.column}
-                      label={f.column.replace(/_/g, ' ')}
-                      min={f.min}
-                      max={f.max}
-                      value={filters.numeric?.[f.column] || [f.min, f.max]}
-                      onChange={(range) => handleNumericChange(f.column, range)}
-                    />
+                    <NumberRange key={f.column} label={f.column.replace(/_/g, ' ')} min={f.min} max={f.max} value={filters.numeric?.[f.column] || [f.min, f.max]} onChange={(range) => handleNumericChange(f.column, range)} />
                   ))}
                 </div>
               )}

@@ -269,7 +269,7 @@ export default function Dashboard() {
     });
   }, [dashboard, filteredRows, filters, activeChartFilter]);
 
-  // PDF Export
+  // PDF Export — captures full scrollable content
   const exportPDF = useCallback(
     async (section = 'dashboard') => {
       setIsExporting(true);
@@ -277,90 +277,109 @@ export default function Dashboard() {
         const html2canvas = (await import('html2canvas')).default;
         const { jsPDF } = await import('jspdf');
 
-        const target =
-          section === 'chat' ? chatRef.current : dashboardRef.current;
+        let target;
+        let scrollParent;
+
+        if (section === 'chat') {
+          // Find the chat scroll container (the messages div)
+          const chatWrapper = chatRef.current;
+          if (!chatWrapper) return;
+          target = chatWrapper;
+          scrollParent = chatWrapper.querySelector('.overflow-y-auto') || chatWrapper;
+        } else {
+          target = dashboardRef.current;
+          // The scroll parent is the flex-1 overflow-y-auto div wrapping dashboardRef
+          scrollParent = dashboardRef.current?.parentElement;
+        }
+
         if (!target) return;
 
+        // Temporarily expand the scroll container to show full content
+        const origOverflow = scrollParent ? scrollParent.style.overflow : '';
+        const origHeight = scrollParent ? scrollParent.style.height : '';
+        const origMaxHeight = scrollParent ? scrollParent.style.maxHeight : '';
+        if (scrollParent) {
+          scrollParent.style.overflow = 'visible';
+          scrollParent.style.height = 'auto';
+          scrollParent.style.maxHeight = 'none';
+        }
+
+        // Wait for reflow
+        await new Promise((r) => setTimeout(r, 300));
+
+        const isDark = document.documentElement.classList.contains('dark');
+
         const canvas = await html2canvas(target, {
-          scale: 2,
+          scale: 1.5,
           useCORS: true,
           logging: false,
-          backgroundColor:
-            document.documentElement.classList.contains('dark')
-              ? '#0F172A'
-              : '#F8FAFC',
+          backgroundColor: isDark ? '#0F172A' : '#F8FAFC',
+          width: target.scrollWidth,
+          height: target.scrollHeight,
+          scrollX: 0,
+          scrollY: 0,
           windowWidth: target.scrollWidth,
           windowHeight: target.scrollHeight,
         });
 
-        const imgData = canvas.toDataURL('image/png');
+        // Restore scroll container
+        if (scrollParent) {
+          scrollParent.style.overflow = origOverflow;
+          scrollParent.style.height = origHeight;
+          scrollParent.style.maxHeight = origMaxHeight;
+        }
+
         const imgWidth = canvas.width;
         const imgHeight = canvas.height;
 
-        const pageWidth = 595.28;
-        const margin = 20;
-        const contentWidth = pageWidth - margin * 2;
-        const contentHeight = (imgHeight * contentWidth) / imgWidth;
+        // A4 dimensions
+        const pdfW = 595.28;
+        const pdfH = 841.89;
+        const margin = 24;
+        const headerHeight = 20;
+        const contentW = pdfW - margin * 2;
+        const scaledH = (imgHeight * contentW) / imgWidth;
 
-        const pdf = new jsPDF({
-          orientation: contentHeight > 800 ? 'landscape' : 'portrait',
-          unit: 'pt',
-          format: 'a4',
-        });
+        const pdf = new jsPDF({ unit: 'pt', format: 'a4' });
+        const usableH = pdfH - margin * 2 - headerHeight;
 
-        const effectivePageHeight =
-          pdf.internal.pageSize.getHeight() - margin * 2;
-        let yOffset = 0;
+        // Header
+        const titleText = section === 'chat' ? 'Chat Export' : 'Dashboard Export';
+        pdf.setFontSize(9);
+        pdf.setTextColor(130);
+        pdf.text(`InsightBoard  —  ${titleText}  —  ${new Date().toLocaleDateString()}`, margin, margin + 8);
 
-        pdf.setFontSize(10);
-        pdf.setTextColor(100);
-        pdf.text(
-          `InsightBoard — ${section === 'chat' ? 'Chat Export' : 'Dashboard Export'} — ${new Date().toLocaleDateString()}`,
-          margin,
-          margin - 5
-        );
+        // Paginate the canvas image
+        let srcY = 0;
+        let pageNum = 0;
+        while (srcY < imgHeight) {
+          if (pageNum > 0) pdf.addPage();
 
-        while (yOffset < contentHeight) {
-          if (yOffset > 0) pdf.addPage();
-
-          const sourceY = (yOffset / contentHeight) * imgHeight;
-          const sourceH = Math.min(
-            (effectivePageHeight / contentHeight) * imgHeight,
-            imgHeight - sourceY
-          );
-          const drawH = (sourceH / imgHeight) * contentHeight;
+          const srcH = Math.min((usableH / scaledH) * imgHeight, imgHeight - srcY);
+          const drawH = (srcH / imgHeight) * scaledH;
 
           const pageCanvas = document.createElement('canvas');
           pageCanvas.width = imgWidth;
-          pageCanvas.height = Math.ceil(sourceH);
-          const ctx = pageCanvas.getContext('2d');
-          ctx.drawImage(
-            canvas,
-            0,
-            Math.floor(sourceY),
-            imgWidth,
-            Math.ceil(sourceH),
-            0,
-            0,
-            imgWidth,
-            Math.ceil(sourceH)
+          pageCanvas.height = Math.ceil(srcH);
+          pageCanvas.getContext('2d').drawImage(
+            canvas, 0, Math.floor(srcY), imgWidth, Math.ceil(srcH),
+            0, 0, imgWidth, Math.ceil(srcH)
           );
 
-          const pageImg = pageCanvas.toDataURL('image/png');
           pdf.addImage(
-            pageImg,
+            pageCanvas.toDataURL('image/png'),
             'PNG',
             margin,
-            margin,
-            contentWidth,
+            margin + headerHeight,
+            contentW,
             drawH
           );
-          yOffset += effectivePageHeight;
+
+          srcY += srcH;
+          pageNum++;
         }
 
-        pdf.save(
-          `insightboard-${section}-${new Date().toISOString().slice(0, 10)}.pdf`
-        );
+        pdf.save(`insightboard-${section}-${new Date().toISOString().slice(0, 10)}.pdf`);
       } catch (err) {
         console.error('PDF export failed:', err);
       } finally {
