@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
 import json
+import math
 import os
 import re
 import urllib.request
@@ -208,6 +209,22 @@ def _agg(nums: list[float], method: str) -> float | None:
     return sum(nums)
 
 
+def _std(nums: list[float]) -> float:
+    """Standard deviation."""
+    if len(nums) < 2:
+        return 0.0
+    m = sum(nums) / len(nums)
+    return math.sqrt(sum((x - m) ** 2 for x in nums) / len(nums))
+
+
+def _median(nums: list[float]) -> float:
+    s = sorted(nums)
+    n = len(s)
+    if n % 2 == 1:
+        return s[n // 2]
+    return (s[n // 2 - 1] + s[n // 2]) / 2
+
+
 def compute_kpis(rows: list[dict], confirmed_kpis: list[dict], time_column: str | None) -> list:
     """Compute KPI values from raw row data using pure Python."""
     results = []
@@ -330,6 +347,833 @@ def build_data_summary(req: AnalyzeRequest) -> str:
     return "\n".join(lines)
 
 
+# ── Heuristic Fallback Engine (works with ZERO API keys) ────────────────────
+
+# Keyword → sector mapping for heuristic detection
+SECTOR_KEYWORDS = {
+    "Sales/CRM": ["revenue", "sales", "deal", "pipeline", "lead", "opportunity", "quota", "commission", "prospect", "account", "crm", "close"],
+    "E-commerce": ["order", "product", "sku", "cart", "shipping", "customer", "item", "price", "discount", "coupon", "store", "shop"],
+    "Marketing": ["campaign", "impression", "click", "ctr", "conversion", "spend", "roi", "channel", "ad", "marketing", "email", "bounce"],
+    "SaaS/Product": ["user", "subscription", "mrr", "arr", "churn", "retention", "signup", "trial", "plan", "tier", "feature", "active"],
+    "Finance": ["amount", "transaction", "balance", "debit", "credit", "account", "payment", "invoice", "tax", "interest", "profit", "loss", "expense", "budget"],
+    "HR": ["employee", "salary", "department", "hire", "termination", "leave", "attendance", "performance", "rating", "position", "headcount"],
+    "Healthcare": ["patient", "diagnosis", "treatment", "medication", "visit", "hospital", "doctor", "nurse", "claim", "procedure", "health"],
+    "Logistics": ["shipment", "delivery", "warehouse", "inventory", "tracking", "freight", "route", "carrier", "dispatch", "supply"],
+    "Customer Support": ["ticket", "issue", "resolution", "sla", "response", "satisfaction", "csat", "nps", "support", "agent", "queue"],
+    "Education": ["student", "course", "grade", "enrollment", "teacher", "class", "exam", "score", "attendance", "semester"],
+}
+
+ORG_KEYWORDS = {
+    "Retail/D2C": ["store", "shop", "product", "sku", "price", "discount"],
+    "Fashion Brand": ["size", "color", "style", "clothing", "apparel", "fashion"],
+    "Food Delivery": ["delivery", "restaurant", "food", "menu", "order"],
+    "Subscription SaaS": ["subscription", "mrr", "arr", "churn", "plan", "tier"],
+    "B2B Agency": ["client", "project", "campaign", "agency", "service"],
+    "Financial Services": ["transaction", "balance", "interest", "loan", "bank"],
+    "Healthcare Provider": ["patient", "diagnosis", "hospital", "doctor"],
+    "Marketplace": ["seller", "buyer", "listing", "marketplace"],
+}
+
+CURRENCY_COL_KEYWORDS = ["revenue", "sales", "price", "cost", "amount", "total",
+                         "profit", "income", "expense", "payment", "fee", "salary",
+                         "wage", "budget", "spend", "value", "balance"]
+
+
+def _detect_sector(headers: list[str], column_meta: dict) -> tuple[str, float, str]:
+    """Detect business sector from column names using keyword matching."""
+    lower_headers = [h.lower().replace("_", " ") for h in headers]
+    all_text = " ".join(lower_headers)
+
+    scores: dict[str, int] = {}
+    for sector, keywords in SECTOR_KEYWORDS.items():
+        score = sum(1 for kw in keywords if kw in all_text)
+        if score > 0:
+            scores[sector] = score
+
+    if not scores:
+        return "General Business", 0.4, "Could not determine specific sector from column names"
+
+    best = max(scores, key=scores.get)
+    max_score = scores[best]
+    confidence = min(0.9, 0.4 + max_score * 0.1)
+    return best, confidence, f"Detected {max_score} matching keywords in column names"
+
+
+def _detect_org_type(headers: list[str], sector: str) -> tuple[str, float, str]:
+    """Detect organization type from column names."""
+    lower_headers = [h.lower().replace("_", " ") for h in headers]
+    all_text = " ".join(lower_headers)
+
+    scores: dict[str, int] = {}
+    for org, keywords in ORG_KEYWORDS.items():
+        score = sum(1 for kw in keywords if kw in all_text)
+        if score > 0:
+            scores[org] = score
+
+    if not scores:
+        # Map sector to a generic org type
+        sector_to_org = {
+            "Sales/CRM": "B2B Company",
+            "E-commerce": "Retail/D2C",
+            "Marketing": "Marketing Org",
+            "SaaS/Product": "Subscription SaaS",
+            "Finance": "Financial Services",
+            "HR": "Enterprise Company",
+            "Healthcare": "Healthcare Provider",
+            "Logistics": "Logistics Company",
+            "Customer Support": "Service Company",
+            "Education": "Educational Institution",
+        }
+        org = sector_to_org.get(sector, "Business Organization")
+        return org, 0.3, "Inferred from detected sector"
+
+    best = max(scores, key=scores.get)
+    confidence = min(0.8, 0.3 + scores[best] * 0.1)
+    return best, confidence, f"Matched {scores[best]} organization keywords"
+
+
+def _detect_currency(column_meta: dict) -> str:
+    """Detect currency from column metadata."""
+    for col, meta in column_meta.items():
+        if meta.get("currency"):
+            return meta["currency"]
+    # Check if column names suggest currency
+    for col in column_meta:
+        if any(kw in col.lower() for kw in CURRENCY_COL_KEYWORDS):
+            return "$"
+    return "$"
+
+
+def _detect_time_column(column_meta: dict) -> str | None:
+    """Find the time/date column."""
+    for col, meta in column_meta.items():
+        if meta.get("type") == "date":
+            return col
+    # Check column names for date-like names
+    date_names = ["date", "time", "timestamp", "created", "updated", "month", "year", "day", "period", "week"]
+    for col in column_meta:
+        if any(dn in col.lower() for dn in date_names):
+            return col
+    return None
+
+
+def _suggest_kpis(headers: list[str], column_meta: dict, total_rows: int) -> list[dict]:
+    """Suggest KPIs based on column types and names."""
+    kpis = []
+    priority = 1
+
+    numeric_cols = [h for h in headers if column_meta.get(h, {}).get("type") == "numeric"]
+    string_cols = [h for h in headers if column_meta.get(h, {}).get("type") == "string"]
+
+    # Revenue/sales-like columns → sum
+    for col in numeric_cols:
+        cl = col.lower()
+        if any(kw in cl for kw in ["revenue", "sales", "total", "amount", "income", "profit"]):
+            label = col.replace("_", " ").title()
+            kpis.append({
+                "id": f"kpi_{priority}",
+                "label": f"Total {label}",
+                "column": col,
+                "aggregation": "sum",
+                "format": "currency",
+                "priority": priority,
+            })
+            priority += 1
+
+    # Count-like columns (or just total records)
+    count_added = False
+    for col in numeric_cols:
+        cl = col.lower()
+        if any(kw in cl for kw in ["order", "transaction", "ticket", "deal", "count"]):
+            kpis.append({
+                "id": f"kpi_{priority}",
+                "label": f"Total {col.replace('_', ' ').title()}s",
+                "column": col,
+                "aggregation": "count",
+                "format": "number",
+                "priority": priority,
+            })
+            priority += 1
+            count_added = True
+            break
+
+    if not count_added and numeric_cols:
+        kpis.append({
+            "id": f"kpi_{priority}",
+            "label": "Total Records",
+            "column": numeric_cols[0],
+            "aggregation": "count",
+            "format": "number",
+            "priority": priority,
+        })
+        priority += 1
+
+    # Average-like columns → mean
+    for col in numeric_cols:
+        cl = col.lower()
+        if any(kw in cl for kw in ["price", "cost", "rate", "score", "rating", "salary", "wage"]):
+            label = col.replace("_", " ").title()
+            is_currency = any(kw in cl for kw in ["price", "cost", "salary", "wage"])
+            kpis.append({
+                "id": f"kpi_{priority}",
+                "label": f"Average {label}",
+                "column": col,
+                "aggregation": "mean",
+                "format": "currency" if is_currency else "number",
+                "priority": priority,
+            })
+            priority += 1
+
+    # Percentage-like columns → mean
+    for col in numeric_cols:
+        cl = col.lower()
+        if any(kw in cl for kw in ["rate", "percent", "ratio", "conversion", "ctr", "bounce"]):
+            if not any(k["column"] == col for k in kpis):  # avoid duplicates
+                kpis.append({
+                    "id": f"kpi_{priority}",
+                    "label": f"Avg {col.replace('_', ' ').title()}",
+                    "column": col,
+                    "aggregation": "mean",
+                    "format": "percent",
+                    "priority": priority,
+                })
+                priority += 1
+
+    # Max value columns → max
+    for col in numeric_cols:
+        cl = col.lower()
+        if any(kw in cl for kw in ["max", "highest", "top", "peak"]):
+            kpis.append({
+                "id": f"kpi_{priority}",
+                "label": f"Max {col.replace('_', ' ').title()}",
+                "column": col,
+                "aggregation": "max",
+                "format": "number",
+                "priority": priority,
+            })
+            priority += 1
+
+    # If we have fewer than 3 KPIs, add remaining numeric columns
+    remaining = [c for c in numeric_cols if not any(k["column"] == c for k in kpis)]
+    for col in remaining:
+        if len(kpis) >= 6:
+            break
+        cl = col.lower()
+        is_currency = any(kw in cl for kw in CURRENCY_COL_KEYWORDS)
+        agg = "sum" if is_currency else "mean"
+        fmt = "currency" if is_currency else "number"
+        label = col.replace("_", " ").title()
+        prefix = "Total" if agg == "sum" else "Average"
+        kpis.append({
+            "id": f"kpi_{priority}",
+            "label": f"{prefix} {label}",
+            "column": col,
+            "aggregation": agg,
+            "format": fmt,
+            "priority": priority,
+        })
+        priority += 1
+
+    return kpis[:8]  # Cap at 8 KPIs
+
+
+def _detect_warnings(column_meta: dict, total_rows: int) -> list[str]:
+    """Detect data quality warnings."""
+    warnings = []
+    for col, meta in column_meta.items():
+        null_count = meta.get("nullCount", 0)
+        if total_rows > 0 and null_count / total_rows > 0.2:
+            pct = round(null_count / total_rows * 100, 0)
+            warnings.append(f'Column "{col}" has {pct:.0f}% missing values')
+    if total_rows < 10:
+        warnings.append("Very small dataset — results may not be statistically meaningful")
+    return warnings
+
+
+def heuristic_analyze(req: AnalyzeRequest) -> dict:
+    """Analyze dataset using rule-based heuristics (no AI needed)."""
+    sector, sector_conf, sector_reason = _detect_sector(req.headers, req.column_meta)
+    org_type, org_conf, org_reason = _detect_org_type(req.headers, sector)
+    currency = _detect_currency(req.column_meta)
+    time_col = _detect_time_column(req.column_meta)
+    kpis = _suggest_kpis(req.headers, req.column_meta, req.total_rows)
+    warnings = _detect_warnings(req.column_meta, req.total_rows)
+
+    numeric_cols = [h for h in req.headers if req.column_meta.get(h, {}).get("type") == "numeric"]
+    string_cols = [h for h in req.headers if req.column_meta.get(h, {}).get("type") == "string"]
+
+    summary = (
+        f"This dataset contains {req.total_rows:,} records across {len(req.headers)} columns. "
+        f"It includes {len(numeric_cols)} numeric field{'s' if len(numeric_cols) != 1 else ''} "
+        f"and {len(string_cols)} text field{'s' if len(string_cols) != 1 else ''}."
+    )
+    if time_col:
+        summary += f" Time-series data is available in the '{time_col}' column."
+
+    return {
+        "sector": sector,
+        "sector_confidence": sector_conf,
+        "sector_reason": sector_reason,
+        "org_type": org_type,
+        "org_type_confidence": org_conf,
+        "org_type_reason": org_reason,
+        "suggested_kpis": kpis,
+        "data_quality_warnings": warnings,
+        "currency": currency,
+        "has_time_series": time_col is not None,
+        "time_column": time_col,
+        "summary": summary,
+    }
+
+
+def _group_by(rows: list[dict], cat_col: str, num_col: str) -> dict[str, list[float]]:
+    """Group rows by a categorical column and collect numeric values."""
+    groups: dict[str, list[float]] = {}
+    for row in rows:
+        cat_val = str(row.get(cat_col, "")).strip()
+        if not cat_val or cat_val.lower() in ("none", "null", "nan", ""):
+            continue
+        n = _to_number(row.get(num_col))
+        if n is not None:
+            groups.setdefault(cat_val, []).append(n)
+    return groups
+
+
+def _make_plotly_layout(title: str, xaxis_title: str = "", yaxis_title: str = "") -> dict:
+    """Create a consistent Plotly layout dict."""
+    layout = {
+        "title": {"text": title, "font": {"size": 16}},
+        "paper_bgcolor": "rgba(0,0,0,0)",
+        "plot_bgcolor": "rgba(0,0,0,0)",
+        "font": {"color": "#334155"},
+        "margin": {"l": 60, "r": 30, "t": 50, "b": 60},
+    }
+    if xaxis_title:
+        layout["xaxis"] = {"title": xaxis_title, "gridcolor": "#E2E8F0"}
+    if yaxis_title:
+        layout["yaxis"] = {"title": yaxis_title, "gridcolor": "#E2E8F0"}
+    return layout
+
+
+CHART_COLORS = ["#4F46E5", "#818CF8", "#06B6D4", "#10B981", "#F59E0B", "#F43F5E", "#8B5CF6", "#EC4899"]
+
+
+def heuristic_dashboard(req: DashboardRequest) -> dict:
+    """Generate dashboard charts using rule-based heuristics (no AI needed)."""
+    charts = []
+    chart_id = 1
+
+    numeric_cols = [h for h in req.headers if req.column_meta.get(h, {}).get("type") == "numeric"]
+    categorical_cols = [
+        h for h in req.headers
+        if req.column_meta.get(h, {}).get("type") == "string"
+        and req.column_meta.get(h, {}).get("uniqueCount", 0) < 20
+        and req.column_meta.get(h, {}).get("uniqueCount", 0) > 1
+    ]
+
+    # Chart 1: Bar chart — top categorical vs first numeric (sum)
+    if categorical_cols and numeric_cols:
+        cat = categorical_cols[0]
+        num = numeric_cols[0]
+        groups = _group_by(req.sample_rows, cat, num)
+        if groups:
+            sorted_groups = sorted(groups.items(), key=lambda x: -sum(x[1]))[:10]
+            labels = [g[0] for g in sorted_groups]
+            values = [round(sum(g[1]), 2) for g in sorted_groups]
+            charts.append({
+                "id": f"chart_{chart_id}",
+                "title": f"{num.replace('_', ' ').title()} by {cat.replace('_', ' ').title()}",
+                "chart_type": "bar",
+                "description": f"Shows total {num} broken down by {cat}",
+                "plotly_data": [{
+                    "type": "bar",
+                    "x": labels,
+                    "y": values,
+                    "marker": {"color": CHART_COLORS[0]},
+                }],
+                "plotly_layout": _make_plotly_layout(
+                    f"{num.replace('_', ' ').title()} by {cat.replace('_', ' ').title()}",
+                    cat.replace("_", " ").title(),
+                    num.replace("_", " ").title(),
+                ),
+                "source_columns": [cat, num],
+            })
+            chart_id += 1
+
+    # Chart 2: Pie chart — distribution of first categorical
+    if categorical_cols:
+        cat = categorical_cols[0]
+        counts: dict[str, int] = {}
+        for row in req.sample_rows:
+            val = str(row.get(cat, "")).strip()
+            if val and val.lower() not in ("none", "null", "nan", ""):
+                counts[val] = counts.get(val, 0) + 1
+        if counts:
+            sorted_counts = sorted(counts.items(), key=lambda x: -x[1])[:8]
+            labels = [c[0] for c in sorted_counts]
+            values = [c[1] for c in sorted_counts]
+            charts.append({
+                "id": f"chart_{chart_id}",
+                "title": f"Distribution of {cat.replace('_', ' ').title()}",
+                "chart_type": "pie",
+                "description": f"Shows the proportion of records across different {cat} categories",
+                "plotly_data": [{
+                    "type": "pie",
+                    "labels": labels,
+                    "values": values,
+                    "marker": {"colors": CHART_COLORS[:len(labels)]},
+                    "hole": 0.4,
+                }],
+                "plotly_layout": _make_plotly_layout(
+                    f"Distribution of {cat.replace('_', ' ').title()}"
+                ),
+                "source_columns": [cat],
+            })
+            chart_id += 1
+
+    # Chart 3: Line chart — time series if available
+    if req.time_column and numeric_cols:
+        num = numeric_cols[0]
+        ts: dict[str, float] = {}
+        for row in req.sample_rows:
+            dv = str(row.get(req.time_column, "")).strip()
+            if not dv:
+                continue
+            n = _to_number(row.get(num))
+            if n is not None:
+                ts[dv] = ts.get(dv, 0) + n
+        if ts:
+            sorted_ts = sorted(ts.items())[:30]
+            x_vals = [t[0] for t in sorted_ts]
+            y_vals = [round(t[1], 2) for t in sorted_ts]
+            charts.append({
+                "id": f"chart_{chart_id}",
+                "title": f"{num.replace('_', ' ').title()} Over Time",
+                "chart_type": "line",
+                "description": f"Tracks how {num} changes over time",
+                "plotly_data": [{
+                    "type": "scatter",
+                    "mode": "lines+markers",
+                    "x": x_vals,
+                    "y": y_vals,
+                    "line": {"color": CHART_COLORS[0], "width": 2},
+                    "marker": {"size": 6},
+                }],
+                "plotly_layout": _make_plotly_layout(
+                    f"{num.replace('_', ' ').title()} Over Time",
+                    req.time_column.replace("_", " ").title(),
+                    num.replace("_", " ").title(),
+                ),
+                "source_columns": [req.time_column, num],
+            })
+            chart_id += 1
+
+    # Chart 4: Bar chart — second categorical x second numeric (if available)
+    if len(categorical_cols) > 1 and len(numeric_cols) > 1:
+        cat = categorical_cols[1] if len(categorical_cols) > 1 else categorical_cols[0]
+        num = numeric_cols[1] if len(numeric_cols) > 1 else numeric_cols[0]
+        groups = _group_by(req.sample_rows, cat, num)
+        if groups:
+            sorted_groups = sorted(groups.items(), key=lambda x: -sum(x[1]))[:10]
+            labels = [g[0] for g in sorted_groups]
+            values = [round(sum(g[1]) / len(g[1]), 2) for g in sorted_groups]
+            charts.append({
+                "id": f"chart_{chart_id}",
+                "title": f"Average {num.replace('_', ' ').title()} by {cat.replace('_', ' ').title()}",
+                "chart_type": "bar",
+                "description": f"Compares average {num} across {cat} categories",
+                "plotly_data": [{
+                    "type": "bar",
+                    "x": labels,
+                    "y": values,
+                    "marker": {"color": CHART_COLORS[2]},
+                }],
+                "plotly_layout": _make_plotly_layout(
+                    f"Average {num.replace('_', ' ').title()} by {cat.replace('_', ' ').title()}",
+                    cat.replace("_", " ").title(),
+                    f"Avg {num.replace('_', ' ').title()}",
+                ),
+                "source_columns": [cat, num],
+            })
+            chart_id += 1
+
+    # Chart 5: Scatter — two numeric columns
+    if len(numeric_cols) >= 2:
+        col_x, col_y = numeric_cols[0], numeric_cols[1]
+        x_vals, y_vals = [], []
+        for row in req.sample_rows[:200]:
+            xn = _to_number(row.get(col_x))
+            yn = _to_number(row.get(col_y))
+            if xn is not None and yn is not None:
+                x_vals.append(xn)
+                y_vals.append(yn)
+        if x_vals:
+            charts.append({
+                "id": f"chart_{chart_id}",
+                "title": f"{col_x.replace('_', ' ').title()} vs {col_y.replace('_', ' ').title()}",
+                "chart_type": "scatter",
+                "description": f"Explores the relationship between {col_x} and {col_y}",
+                "plotly_data": [{
+                    "type": "scatter",
+                    "mode": "markers",
+                    "x": x_vals,
+                    "y": y_vals,
+                    "marker": {"color": CHART_COLORS[3], "size": 8, "opacity": 0.7},
+                }],
+                "plotly_layout": _make_plotly_layout(
+                    f"{col_x.replace('_', ' ').title()} vs {col_y.replace('_', ' ').title()}",
+                    col_x.replace("_", " ").title(),
+                    col_y.replace("_", " ").title(),
+                ),
+                "source_columns": [col_x, col_y],
+            })
+            chart_id += 1
+
+    # Chart 6: Horizontal bar — top values for another combo
+    if len(categorical_cols) >= 1 and len(numeric_cols) >= 2:
+        cat = categorical_cols[0]
+        num = numeric_cols[1] if len(numeric_cols) > 1 else numeric_cols[0]
+        # skip if same as chart 1
+        if not (charts and charts[0].get("source_columns") == [cat, num]):
+            groups = _group_by(req.sample_rows, cat, num)
+            if groups:
+                sorted_groups = sorted(groups.items(), key=lambda x: -sum(x[1]))[:8]
+                labels = [g[0] for g in sorted_groups]
+                values = [round(sum(g[1]), 2) for g in sorted_groups]
+                charts.append({
+                    "id": f"chart_{chart_id}",
+                    "title": f"Top {cat.replace('_', ' ').title()} by {num.replace('_', ' ').title()}",
+                    "chart_type": "bar",
+                    "description": f"Rankings of {cat} by total {num}",
+                    "plotly_data": [{
+                        "type": "bar",
+                        "x": values,
+                        "y": labels,
+                        "orientation": "h",
+                        "marker": {"color": CHART_COLORS[4]},
+                    }],
+                    "plotly_layout": _make_plotly_layout(
+                        f"Top {cat.replace('_', ' ').title()} by {num.replace('_', ' ').title()}",
+                        num.replace("_", " ").title(),
+                        "",
+                    ),
+                    "source_columns": [cat, num],
+                })
+                chart_id += 1
+
+    # Ensure at least 2 charts exist — add a numeric histogram if needed
+    if len(charts) < 2 and numeric_cols:
+        col = numeric_cols[0]
+        vals = _extract_column(req.sample_rows, col)
+        if vals:
+            charts.append({
+                "id": f"chart_{chart_id}",
+                "title": f"Distribution of {col.replace('_', ' ').title()}",
+                "chart_type": "bar",
+                "description": f"Histogram showing the distribution of {col} values",
+                "plotly_data": [{
+                    "type": "histogram",
+                    "x": vals[:500],
+                    "marker": {"color": CHART_COLORS[1]},
+                    "nbinsx": 20,
+                }],
+                "plotly_layout": _make_plotly_layout(
+                    f"Distribution of {col.replace('_', ' ').title()}",
+                    col.replace("_", " ").title(),
+                    "Frequency",
+                ),
+                "source_columns": [col],
+            })
+
+    return {
+        "dashboard_title": "Data Dashboard",
+        "charts": charts[:6],
+    }
+
+
+def heuristic_chat(req: ChatRequest) -> dict:
+    """Answer chat questions using basic statistics (no AI needed)."""
+    question = req.question.lower()
+    numeric_cols = [h for h in req.headers if req.column_meta.get(h, {}).get("type") == "numeric"]
+    categorical_cols = [
+        h for h in req.headers
+        if req.column_meta.get(h, {}).get("type") == "string"
+        and req.column_meta.get(h, {}).get("uniqueCount", 0) < 50
+    ]
+
+    items = []
+    follow_ups = []
+
+    # Check if question mentions a specific column
+    mentioned_col = None
+    for h in req.headers:
+        if h.lower() in question or h.lower().replace("_", " ") in question:
+            mentioned_col = h
+            break
+
+    # ── "Summary" / "overview" / generic questions ──
+    if any(kw in question for kw in ["summary", "overview", "tell me about", "describe", "what is this"]):
+        text = f"Your dataset has {req.total_rows:,} records across {len(req.headers)} columns. "
+        if numeric_cols:
+            col = numeric_cols[0]
+            vals = _extract_column(req.sample_rows, col)
+            if vals:
+                text += f"The {col} column ranges from {min(vals):,.2f} to {max(vals):,.2f} "
+                text += f"with an average of {sum(vals)/len(vals):,.2f}. "
+        if categorical_cols:
+            col = categorical_cols[0]
+            unique = req.column_meta.get(col, {}).get("uniqueCount", 0)
+            text += f"There are {unique} unique {col} values."
+        items.append({"type": "text", "content": text})
+        follow_ups = [
+            f"What are the top {categorical_cols[0]} values?" if categorical_cols else "What columns are available?",
+            f"What is the average {numeric_cols[0]}?" if numeric_cols else "Show me the data distribution",
+            "Are there any trends over time?",
+        ]
+
+    # ── "Top" / "highest" / "best" / "rank" ──
+    elif any(kw in question for kw in ["top", "highest", "best", "most", "rank", "largest", "biggest"]):
+        target_col = mentioned_col
+        if not target_col and categorical_cols:
+            target_col = categorical_cols[0]
+        if target_col and target_col in categorical_cols and numeric_cols:
+            num = numeric_cols[0]
+            groups = _group_by(req.sample_rows, target_col, num)
+            if groups:
+                sorted_g = sorted(groups.items(), key=lambda x: -sum(x[1]))[:10]
+                table_headers = [target_col, f"Total {num}", "Count"]
+                table_rows = [[g[0], f"{sum(g[1]):,.2f}", str(len(g[1]))] for g in sorted_g]
+                text = f"Here are the top {target_col} values ranked by total {num}. "
+                text += f"{sorted_g[0][0]} leads with a total of {sum(sorted_g[0][1]):,.2f}."
+                items.append({"type": "text", "content": text})
+                items.append({"type": "table", "table_data": {"headers": table_headers, "rows": table_rows}})
+                # Bar chart
+                items.append({"type": "chart", "chart_spec": {
+                    "title": f"Top {target_col} by {num}",
+                    "plotly_data": [{
+                        "type": "bar",
+                        "x": [g[0] for g in sorted_g],
+                        "y": [round(sum(g[1]), 2) for g in sorted_g],
+                        "marker": {"color": CHART_COLORS[0]},
+                    }],
+                    "plotly_layout": _make_plotly_layout(
+                        f"Top {target_col} by {num}",
+                        target_col, num
+                    ),
+                }})
+            else:
+                items.append({"type": "text", "content": f"I couldn't find grouped data for {target_col}."})
+        elif target_col and numeric_cols:
+            vals = _extract_column(req.sample_rows, target_col if target_col in numeric_cols else numeric_cols[0])
+            col_name = target_col if target_col in numeric_cols else numeric_cols[0]
+            if vals:
+                top_vals = sorted(vals, reverse=True)[:10]
+                text = f"The highest {col_name} values are: {', '.join(f'{v:,.2f}' for v in top_vals[:5])}."
+                items.append({"type": "text", "content": text})
+            else:
+                items.append({"type": "text", "content": "I couldn't extract numeric data for that column."})
+        else:
+            items.append({"type": "text", "content": "I couldn't determine which column to rank. Try asking about a specific column."})
+        follow_ups = [
+            f"What about the bottom {categorical_cols[0]} values?" if categorical_cols else "Show me the data distribution",
+            f"How does {numeric_cols[0]} compare across categories?" if numeric_cols and categorical_cols else "Show me a summary",
+            "What is the overall trend?",
+        ]
+
+    # ── "Average" / "mean" / "typical" ──
+    elif any(kw in question for kw in ["average", "mean", "typical", "avg"]):
+        target = mentioned_col if mentioned_col and mentioned_col in numeric_cols else (numeric_cols[0] if numeric_cols else None)
+        if target:
+            vals = _extract_column(req.sample_rows, target)
+            if vals:
+                avg = sum(vals) / len(vals)
+                med = _median(vals)
+                std = _std(vals)
+                text = (
+                    f"The average {target} is {avg:,.2f}. "
+                    f"The median is {med:,.2f} and the standard deviation is {std:,.2f}. "
+                    f"Based on {len(vals):,} data points."
+                )
+                items.append({"type": "text", "content": text})
+            else:
+                items.append({"type": "text", "content": f"No numeric data found for {target}."})
+        else:
+            items.append({"type": "text", "content": "No numeric columns found to calculate an average."})
+        follow_ups = [
+            f"What is the maximum {target}?" if target else "Show me the data summary",
+            "How does this break down by category?",
+            "Is there a trend over time?",
+        ]
+
+    # ── "Trend" / "over time" / "growth" ──
+    elif any(kw in question for kw in ["trend", "over time", "growth", "change", "time series", "timeline"]):
+        time_col = _detect_time_column(req.column_meta)
+        target = mentioned_col if mentioned_col and mentioned_col in numeric_cols else (numeric_cols[0] if numeric_cols else None)
+        if time_col and target:
+            ts: dict[str, float] = {}
+            for row in req.sample_rows:
+                dv = str(row.get(time_col, "")).strip()
+                if not dv:
+                    continue
+                n = _to_number(row.get(target))
+                if n is not None:
+                    ts[dv] = ts.get(dv, 0) + n
+            if ts:
+                sorted_ts = sorted(ts.items())[:30]
+                x_vals = [t[0] for t in sorted_ts]
+                y_vals = [round(t[1], 2) for t in sorted_ts]
+                first_val = y_vals[0] if y_vals else 0
+                last_val = y_vals[-1] if y_vals else 0
+                direction = "increased" if last_val > first_val else "decreased"
+                text = (
+                    f"{target} has {direction} over the period. "
+                    f"It started at {first_val:,.2f} and the most recent value is {last_val:,.2f}."
+                )
+                items.append({"type": "text", "content": text})
+                items.append({"type": "chart", "chart_spec": {
+                    "title": f"{target} Over Time",
+                    "plotly_data": [{
+                        "type": "scatter",
+                        "mode": "lines+markers",
+                        "x": x_vals,
+                        "y": y_vals,
+                        "line": {"color": CHART_COLORS[0], "width": 2},
+                    }],
+                    "plotly_layout": _make_plotly_layout(f"{target} Over Time", time_col, target),
+                }})
+            else:
+                items.append({"type": "text", "content": "Couldn't build a time series from the available data."})
+        else:
+            items.append({"type": "text", "content": "No time column detected in the dataset to analyze trends."})
+        follow_ups = [
+            "What is the overall average?",
+            f"Which {categorical_cols[0]} is growing fastest?" if categorical_cols else "Show me a summary",
+            "What was the peak value?",
+        ]
+
+    # ── "Compare" / "breakdown" / "by" / "distribution" ──
+    elif any(kw in question for kw in ["compare", "breakdown", "by", "distribution", "split", "across", "between"]):
+        cat = None
+        for c in categorical_cols:
+            if c.lower() in question or c.lower().replace("_", " ") in question:
+                cat = c
+                break
+        if not cat and categorical_cols:
+            cat = categorical_cols[0]
+        num = mentioned_col if mentioned_col and mentioned_col in numeric_cols else (numeric_cols[0] if numeric_cols else None)
+        if cat and num:
+            groups = _group_by(req.sample_rows, cat, num)
+            if groups:
+                sorted_g = sorted(groups.items(), key=lambda x: -sum(x[1]))[:10]
+                text = f"Here's how {num} breaks down by {cat}. "
+                text += f"The highest is {sorted_g[0][0]} with {sum(sorted_g[0][1]):,.2f} total."
+                items.append({"type": "text", "content": text})
+                items.append({"type": "chart", "chart_spec": {
+                    "title": f"{num} by {cat}",
+                    "plotly_data": [{
+                        "type": "bar",
+                        "x": [g[0] for g in sorted_g],
+                        "y": [round(sum(g[1]), 2) for g in sorted_g],
+                        "marker": {"color": CHART_COLORS[0]},
+                    }],
+                    "plotly_layout": _make_plotly_layout(f"{num} by {cat}", cat, num),
+                }})
+            else:
+                items.append({"type": "text", "content": f"No grouped data found for {cat} and {num}."})
+        else:
+            items.append({"type": "text", "content": "I need both a category and a numeric column to compare. Try specifying column names."})
+        follow_ups = [
+            f"What are the top {cat} values?" if cat else "Show me a summary",
+            f"What is the trend of {num} over time?" if num else "What columns are available?",
+            "Show me the data distribution",
+        ]
+
+    # ── "Count" / "how many" ──
+    elif any(kw in question for kw in ["count", "how many", "number of", "total records"]):
+        if mentioned_col and mentioned_col in categorical_cols:
+            counts: dict[str, int] = {}
+            for row in req.sample_rows:
+                val = str(row.get(mentioned_col, "")).strip()
+                if val and val.lower() not in ("none", "null", "nan", ""):
+                    counts[val] = counts.get(val, 0) + 1
+            sorted_c = sorted(counts.items(), key=lambda x: -x[1])[:15]
+            text = f"There are {len(counts)} unique {mentioned_col} values across {req.total_rows:,} records. "
+            if sorted_c:
+                text += f"The most common is '{sorted_c[0][0]}' with {sorted_c[0][1]} occurrences."
+            items.append({"type": "text", "content": text})
+            if sorted_c:
+                items.append({"type": "table", "table_data": {
+                    "headers": [mentioned_col, "Count"],
+                    "rows": [[c[0], str(c[1])] for c in sorted_c],
+                }})
+        else:
+            text = f"The dataset has {req.total_rows:,} total records with {len(req.headers)} columns."
+            items.append({"type": "text", "content": text})
+        follow_ups = [
+            "Show me the data distribution",
+            f"What is the average {numeric_cols[0]}?" if numeric_cols else "Show me a summary",
+            "Which category has the most records?",
+        ]
+
+    # ── "Column" / "what columns" / "fields" ──
+    elif any(kw in question for kw in ["column", "field", "what data", "available", "what can"]):
+        col_lines = []
+        for h in req.headers:
+            meta = req.column_meta.get(h, {})
+            col_lines.append(f"- **{h}**: {meta.get('type', 'unknown')} ({meta.get('uniqueCount', 0)} unique values)")
+        text = f"Your dataset has {len(req.headers)} columns:\n\n" + "\n".join(col_lines)
+        items.append({"type": "text", "content": text})
+        follow_ups = [
+            "Give me a summary of the data",
+            f"What is the average {numeric_cols[0]}?" if numeric_cols else "How many records are there?",
+            "Show me the top values",
+        ]
+
+    # ── Default / general question ──
+    else:
+        text = f"Here's a quick overview of your data: {req.total_rows:,} records across {len(req.headers)} columns. "
+        if numeric_cols:
+            col = numeric_cols[0]
+            vals = _extract_column(req.sample_rows, col)
+            if vals:
+                text += f"The {col} ranges from {min(vals):,.2f} to {max(vals):,.2f} (average: {sum(vals)/len(vals):,.2f}). "
+        if categorical_cols:
+            col = categorical_cols[0]
+            unique = req.column_meta.get(col, {}).get("uniqueCount", 0)
+            text += f"There are {unique} unique {col} categories."
+
+        items.append({"type": "text", "content": text})
+
+        # Add a table with basic stats for numeric columns
+        if numeric_cols:
+            table_headers = ["Column", "Min", "Max", "Average", "Count"]
+            table_rows = []
+            for col in numeric_cols[:10]:
+                vals = _extract_column(req.sample_rows, col)
+                if vals:
+                    table_rows.append([
+                        col,
+                        f"{min(vals):,.2f}",
+                        f"{max(vals):,.2f}",
+                        f"{sum(vals)/len(vals):,.2f}",
+                        str(len(vals)),
+                    ])
+            if table_rows:
+                items.append({"type": "table", "table_data": {"headers": table_headers, "rows": table_rows}})
+
+        follow_ups = [
+            "Show me the top categories" if categorical_cols else "What columns are available?",
+            f"What is the trend of {numeric_cols[0]} over time?" if numeric_cols else "Give me a summary",
+            "How does the data break down by category?",
+        ]
+
+    if not items:
+        items.append({"type": "text", "content": "I analyzed your question but couldn't find specific data to answer it. Try asking about trends, averages, comparisons, or top values."})
+        follow_ups = ["Give me a summary", "What columns are available?", "Show me the top values"]
+
+    return {"items": items, "follow_ups": follow_ups[:3]}
+
+
 # ── Gemini API Call (zero external dependencies) ─────────────────────────────
 
 
@@ -394,8 +1238,9 @@ def _parse_ai_text(text: str) -> dict:
     return json.loads(text.strip())
 
 
-def call_ai(system_prompt: str, user_message: str) -> dict:
-    """Call AI with auto-provider detection, retry, and fallback."""
+def call_ai(system_prompt: str, user_message: str) -> dict | None:
+    """Call AI with auto-provider detection, retry, and fallback.
+    Returns None if all providers fail (caller should use heuristics)."""
     providers = []
     if GROQ_API_KEY:
         providers.append(("Groq", _call_groq))
@@ -403,12 +1248,7 @@ def call_ai(system_prompt: str, user_message: str) -> dict:
         providers.append(("Gemini", _call_gemini))
 
     if not providers:
-        raise HTTPException(
-            status_code=500,
-            detail="No AI API key configured. Add GROQ_API_KEY or GEMINI_API_KEY to your Vercel environment variables. Get a free Groq key at https://console.groq.com",
-        )
-
-    last_error_msg = ""
+        return None  # No providers — use heuristics
 
     for provider_name, provider_fn in providers:
         for attempt in range(3):
@@ -416,38 +1256,28 @@ def call_ai(system_prompt: str, user_message: str) -> dict:
                 raw_text = provider_fn(system_prompt, user_message)
                 return _parse_ai_text(raw_text)
             except urllib.error.HTTPError as e:
-                error_body = ""
                 try:
-                    error_body = e.read().decode("utf-8")[:300]
+                    e.read()
                 except Exception:
                     pass
                 if e.code == 429:
-                    last_error_msg = f"{provider_name} rate limited"
                     time.sleep(2 * (attempt + 1))
                     continue
                 else:
-                    last_error_msg = f"{provider_name} error ({e.code}): {error_body}"
                     break  # Try next provider
             except urllib.error.URLError:
-                last_error_msg = f"Could not connect to {provider_name}"
                 break
             except json.JSONDecodeError:
                 if attempt < 2:
                     time.sleep(1)
                     continue
-                last_error_msg = f"{provider_name} returned invalid JSON"
                 break
             except (KeyError, IndexError):
-                last_error_msg = f"{provider_name} returned unexpected format"
                 break
-            except Exception as exc:
-                last_error_msg = f"{provider_name}: {str(exc)[:200]}"
+            except Exception:
                 break
 
-    raise HTTPException(
-        status_code=500,
-        detail=f"AI service unavailable. {last_error_msg}. Please try again in a moment.",
-    )
+    return None  # All providers failed — use heuristics
 
 
 # ── API Endpoints ────────────────────────────────────────────────────────────
@@ -470,14 +1300,22 @@ async def analyze(req: AnalyzeRequest):
 {json.dumps(req.sample_rows[:5], indent=2, default=str)}
 """
         result = call_ai(ANALYZE_SYSTEM_PROMPT, user_message)
-        return result
+        if result is not None:
+            return result
+
+        # AI unavailable — use heuristic analysis
+        return heuristic_analyze(req)
     except HTTPException:
         raise
     except Exception:
-        raise HTTPException(
-            status_code=500,
-            detail="We couldn't analyse your data right now. Please try again.",
-        )
+        # Even if something crashes, try heuristics as last resort
+        try:
+            return heuristic_analyze(req)
+        except Exception:
+            raise HTTPException(
+                status_code=500,
+                detail="We couldn't analyse your data right now. Please try again.",
+            )
 
 
 @app.post("/api/dashboard")
@@ -501,15 +1339,27 @@ async def dashboard(req: DashboardRequest):
 Design 4-6 charts using the actual aggregated values above. Use business-friendly titles and descriptions.
 """
         result = call_ai(DASHBOARD_SYSTEM_PROMPT, user_message)
+        if result is not None:
+            result["kpi_cards"] = kpi_cards
+            return result
+
+        # AI unavailable — use heuristic dashboard
+        result = heuristic_dashboard(req)
         result["kpi_cards"] = kpi_cards
         return result
     except HTTPException:
         raise
     except Exception:
-        raise HTTPException(
-            status_code=500,
-            detail="We couldn't generate the dashboard right now. Please try again.",
-        )
+        try:
+            kpi_cards = compute_kpis(req.sample_rows, req.confirmed_kpis, req.time_column)
+            result = heuristic_dashboard(req)
+            result["kpi_cards"] = kpi_cards
+            return result
+        except Exception:
+            raise HTTPException(
+                status_code=500,
+                detail="We couldn't generate the dashboard right now. Please try again.",
+            )
 
 
 @app.post("/api/chat")
@@ -540,14 +1390,21 @@ async def chat(req: ChatRequest):
 Provide a helpful answer with text, and include a chart or table if it would help explain the answer.
 """
         result = call_ai(CHAT_SYSTEM_PROMPT, user_message)
-        return result
+        if result is not None:
+            return result
+
+        # AI unavailable — use heuristic chat
+        return heuristic_chat(req)
     except HTTPException:
         raise
     except Exception:
-        raise HTTPException(
-            status_code=500,
-            detail="I couldn't process your question right now. Please try again.",
-        )
+        try:
+            return heuristic_chat(req)
+        except Exception:
+            raise HTTPException(
+                status_code=500,
+                detail="I couldn't process your question right now. Please try again.",
+            )
 
 
 @app.get("/api/health")
@@ -559,5 +1416,6 @@ async def health():
         providers.append("gemini")
     return {
         "status": "ok",
-        "providers": providers or ["NONE - add GROQ_API_KEY or GEMINI_API_KEY"],
+        "providers": providers or ["none (using built-in heuristics)"],
+        "fallback": "heuristic analysis always available",
     }
