@@ -3,10 +3,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
 import anthropic
-import pandas as pd
 import json
 import os
-import traceback
+import re
 
 app = FastAPI()
 
@@ -154,7 +153,175 @@ You MUST respond with valid JSON:
 }"""
 
 
-# ── Helper Functions ─────────────────────────────────────────────────────────
+# ── Pure Python Helpers (no pandas/numpy) ────────────────────────────────────
+
+_CURRENCY_RE = re.compile(r"[$€£¥₹,\s()%]")
+
+
+def _to_number(val) -> float | None:
+    """Convert a value to float, stripping currency symbols and formatting."""
+    if val is None or val == "":
+        return None
+    s = str(val).strip()
+    cleaned = _CURRENCY_RE.sub("", s)
+    # Handle parenthetical negatives: (1000) -> -1000
+    if cleaned.startswith("-") is False and s.startswith("(") and s.endswith(")"):
+        cleaned = "-" + cleaned
+    try:
+        return float(cleaned)
+    except (ValueError, TypeError):
+        return None
+
+
+def _extract_column(rows: list[dict], col: str) -> list:
+    """Extract numeric values for a column from rows."""
+    nums = []
+    for row in rows:
+        n = _to_number(row.get(col))
+        if n is not None:
+            nums.append(n)
+    return nums
+
+
+def _agg(nums: list[float], method: str) -> float | None:
+    """Apply an aggregation to a list of numbers."""
+    if not nums:
+        return None
+    if method == "sum":
+        return sum(nums)
+    if method == "mean":
+        return sum(nums) / len(nums)
+    if method == "count":
+        return float(len(nums))
+    if method == "max":
+        return max(nums)
+    if method == "min":
+        return min(nums)
+    return sum(nums)
+
+
+def compute_kpis(rows: list[dict], confirmed_kpis: list[dict], time_column: str | None) -> list:
+    """Compute KPI values from raw row data using pure Python."""
+    results = []
+    for kpi in confirmed_kpis:
+        col = kpi.get("column", "")
+        agg_method = kpi.get("aggregation", "sum")
+
+        nums = _extract_column(rows, col)
+        if not nums:
+            continue
+
+        value = _agg(nums, agg_method)
+        if value is None:
+            continue
+
+        # Period-over-period change
+        change_percent = None
+        change_direction = None
+        if time_column:
+            try:
+                sorted_rows = sorted(rows, key=lambda r: str(r.get(time_column, "")))
+                mid = len(sorted_rows) // 2
+                first_nums = _extract_column(sorted_rows[:mid], col)
+                second_nums = _extract_column(sorted_rows[mid:], col)
+                first_sum = sum(first_nums) if first_nums else 0
+                second_sum = sum(second_nums) if second_nums else 0
+                if first_sum != 0:
+                    change_percent = round(((second_sum - first_sum) / abs(first_sum)) * 100, 1)
+                    change_direction = "up" if change_percent > 0 else "down"
+            except Exception:
+                pass
+
+        fmt = kpi.get("format", "number")
+        if fmt == "currency":
+            formatted = f"${value:,.2f}"
+        elif fmt == "percent":
+            formatted = f"{value:.1f}%"
+        else:
+            formatted = f"{value:,.0f}" if abs(value) >= 100 else f"{value:.2f}"
+
+        results.append({
+            "id": kpi.get("id", ""),
+            "label": kpi.get("label", col),
+            "value": value,
+            "formatted_value": formatted,
+            "change_percent": change_percent,
+            "change_direction": change_direction,
+            "format": fmt,
+        })
+
+    return results
+
+
+def build_aggregation_summary(rows: list[dict], column_meta: dict) -> str:
+    """Build cross-tabulation summaries using pure Python."""
+    categorical = [
+        k for k, v in column_meta.items()
+        if v.get("type") == "string" and v.get("uniqueCount", 0) < 20
+    ]
+    numeric = [k for k, v in column_meta.items() if v.get("type") == "numeric"]
+    parts = []
+
+    for cat in categorical[:3]:
+        for num in numeric[:4]:
+            groups: dict[str, list[float]] = {}
+            for row in rows:
+                cat_val = str(row.get(cat, "")).strip()
+                if not cat_val or cat_val.lower() in ("none", "null", ""):
+                    continue
+                n = _to_number(row.get(num))
+                if n is not None:
+                    groups.setdefault(cat_val, []).append(n)
+
+            if not groups:
+                continue
+
+            lines = [f"\n{cat} x {num}:"]
+            lines.append(f"  {'Category':<30} {'Sum':>12} {'Avg':>12} {'Count':>8}")
+            for gname, gvals in sorted(groups.items(), key=lambda x: -sum(x[1]))[:10]:
+                s = sum(gvals)
+                a = s / len(gvals)
+                c = len(gvals)
+                lines.append(f"  {gname:<30} {s:>12.1f} {a:>12.1f} {c:>8}")
+            parts.append("\n".join(lines))
+
+    # Time series summary
+    date_cols = [k for k, v in column_meta.items() if v.get("type") == "date"]
+    if date_cols and numeric:
+        dc = date_cols[0]
+        for num in numeric[:2]:
+            ts: dict[str, float] = {}
+            for row in rows:
+                dv = str(row.get(dc, "")).strip()
+                if not dv:
+                    continue
+                n = _to_number(row.get(num))
+                if n is not None:
+                    ts[dv] = ts.get(dv, 0) + n
+            if ts:
+                lines = [f"\nTime series {dc} x {num}:"]
+                for k, v in sorted(ts.items())[:20]:
+                    lines.append(f"  {k}: {v:.1f}")
+                parts.append("\n".join(lines))
+
+    return "\n".join(parts) if parts else "No cross-tabulations could be computed."
+
+
+def build_data_summary(req: AnalyzeRequest) -> str:
+    lines = []
+    for header in req.headers:
+        meta = req.column_meta.get(header, {})
+        line = f"- {header}: type={meta.get('type', 'unknown')}"
+        line += f", nulls={meta.get('nullCount', 0)}/{req.total_rows}"
+        line += f", unique={meta.get('uniqueCount', 0)}"
+        if meta.get("type") == "numeric":
+            line += f", range=[{meta.get('min')}, {meta.get('max')}], mean={meta.get('mean')}"
+        if meta.get("currency"):
+            line += f", currency={meta.get('currency')}"
+        samples = meta.get("sampleValues", [])[:3]
+        line += f", samples={samples}"
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def call_claude(system_prompt: str, user_message: str) -> dict:
@@ -180,148 +347,11 @@ def call_claude(system_prompt: str, user_message: str) -> dict:
             status_code=500,
             detail="The AI returned an unexpected response. Please try again.",
         )
-    except anthropic.APIError as e:
+    except anthropic.APIError:
         raise HTTPException(
             status_code=500,
             detail="Could not connect to the AI service. Please check your API key and try again.",
         )
-
-
-def build_data_summary(req: AnalyzeRequest) -> str:
-    lines = []
-    for header in req.headers:
-        meta = req.column_meta.get(header, {})
-        line = f"- {header}: type={meta.get('type', 'unknown')}"
-        line += f", nulls={meta.get('nullCount', 0)}/{req.total_rows}"
-        line += f", unique={meta.get('uniqueCount', 0)}"
-        if meta.get("type") == "numeric":
-            line += f", range=[{meta.get('min')}, {meta.get('max')}], mean={meta.get('mean')}"
-        if meta.get("currency"):
-            line += f", currency={meta.get('currency')}"
-        samples = meta.get("sampleValues", [])[:3]
-        line += f", samples={samples}"
-        lines.append(line)
-    return "\n".join(lines)
-
-
-def compute_kpis(df: pd.DataFrame, confirmed_kpis: list, time_column: str | None) -> list:
-    results = []
-    for kpi in confirmed_kpis:
-        col = kpi.get("column", "")
-        agg = kpi.get("aggregation", "sum")
-
-        if col not in df.columns:
-            continue
-
-        series = pd.to_numeric(
-            df[col].astype(str).str.replace(r"[$,\s()%€£¥₹]", "", regex=True),
-            errors="coerce",
-        ).dropna()
-
-        if series.empty:
-            continue
-
-        if agg == "sum":
-            value = float(series.sum())
-        elif agg == "mean":
-            value = float(series.mean())
-        elif agg == "count":
-            value = int(len(series))
-        elif agg == "max":
-            value = float(series.max())
-        elif agg == "min":
-            value = float(series.min())
-        else:
-            value = float(series.sum())
-
-        change_percent = None
-        change_direction = None
-        if time_column and time_column in df.columns:
-            try:
-                df_sorted = df.sort_values(time_column)
-                midpoint = len(df_sorted) // 2
-                first_half = pd.to_numeric(
-                    df_sorted[col].iloc[:midpoint]
-                    .astype(str)
-                    .str.replace(r"[$,\s()%€£¥₹]", "", regex=True),
-                    errors="coerce",
-                ).dropna()
-                second_half = pd.to_numeric(
-                    df_sorted[col].iloc[midpoint:]
-                    .astype(str)
-                    .str.replace(r"[$,\s()%€£¥₹]", "", regex=True),
-                    errors="coerce",
-                ).dropna()
-                if len(first_half) > 0 and first_half.sum() != 0:
-                    change_percent = round(
-                        ((second_half.sum() - first_half.sum()) / abs(first_half.sum())) * 100,
-                        1,
-                    )
-                    change_direction = "up" if change_percent > 0 else "down"
-            except Exception:
-                pass
-
-        fmt = kpi.get("format", "number")
-        if fmt == "currency":
-            formatted = f"${value:,.2f}"
-        elif fmt == "percent":
-            formatted = f"{value:.1f}%"
-        else:
-            formatted = f"{value:,.0f}" if abs(value) >= 100 else f"{value:.2f}"
-
-        results.append(
-            {
-                "id": kpi.get("id", ""),
-                "label": kpi.get("label", col),
-                "value": value,
-                "formatted_value": formatted,
-                "change_percent": change_percent,
-                "change_direction": change_direction,
-                "format": fmt,
-            }
-        )
-
-    return results
-
-
-def build_aggregation_summary(df: pd.DataFrame, column_meta: dict) -> str:
-    parts = []
-    categorical = [
-        k
-        for k, v in column_meta.items()
-        if v.get("type") == "string" and v.get("uniqueCount", 0) < 20 and k in df.columns
-    ]
-    numeric = [k for k, v in column_meta.items() if v.get("type") == "numeric" and k in df.columns]
-
-    # Clean numeric columns
-    for col in numeric:
-        df[col] = pd.to_numeric(
-            df[col].astype(str).str.replace(r"[$,\s()%€£¥₹]", "", regex=True),
-            errors="coerce",
-        )
-
-    for cat in categorical[:3]:
-        for num in numeric[:4]:
-            try:
-                grouped = df.groupby(cat)[num].agg(["sum", "mean", "count"]).head(10)
-                if not grouped.empty:
-                    parts.append(f"\n{cat} x {num}:\n{grouped.to_string()}")
-            except Exception:
-                pass
-
-    # Time series summary if available
-    date_cols = [k for k, v in column_meta.items() if v.get("type") == "date" and k in df.columns]
-    if date_cols and numeric:
-        for dc in date_cols[:1]:
-            for num in numeric[:2]:
-                try:
-                    ts = df.groupby(dc)[num].sum().head(20)
-                    if not ts.empty:
-                        parts.append(f"\nTime series {dc} x {num}:\n{ts.to_string()}")
-                except Exception:
-                    pass
-
-    return "\n".join(parts) if parts else "No cross-tabulations could be computed."
 
 
 # ── API Endpoints ────────────────────────────────────────────────────────────
@@ -347,7 +377,7 @@ async def analyze(req: AnalyzeRequest):
         return result
     except HTTPException:
         raise
-    except Exception as e:
+    except Exception:
         raise HTTPException(
             status_code=500,
             detail="We couldn't analyse your data right now. Please try again.",
@@ -357,9 +387,8 @@ async def analyze(req: AnalyzeRequest):
 @app.post("/api/dashboard")
 async def dashboard(req: DashboardRequest):
     try:
-        df = pd.DataFrame(req.sample_rows)
-        kpi_cards = compute_kpis(df, req.confirmed_kpis, req.time_column)
-        agg_summary = build_aggregation_summary(df.copy(), req.column_meta)
+        kpi_cards = compute_kpis(req.sample_rows, req.confirmed_kpis, req.time_column)
+        agg_summary = build_aggregation_summary(req.sample_rows, req.column_meta)
 
         user_message = f"""Design a dashboard with charts for this business data.
 
@@ -380,7 +409,7 @@ Design 4-6 charts using the actual aggregated values above. Use business-friendl
         return result
     except HTTPException:
         raise
-    except Exception as e:
+    except Exception:
         raise HTTPException(
             status_code=500,
             detail="We couldn't generate the dashboard right now. Please try again.",
@@ -418,7 +447,7 @@ Provide a helpful answer with text, and include a chart or table if it would hel
         return result
     except HTTPException:
         raise
-    except Exception as e:
+    except Exception:
         raise HTTPException(
             status_code=500,
             detail="I couldn't process your question right now. Please try again.",
